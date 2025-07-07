@@ -186,33 +186,43 @@ def upload_attachment():
     })
 
 #教师端发布实验接口
-@app.route('/teacher/experiment/publish', methods=['POST'])
-def publish_experiment():
+@app.route('/teacher/experiment/publish_with_attachment', methods=['POST'])
+def publish_experiment_with_attachment():
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'code': 400, 'message': '参数错误：请求数据不能为空'}), 400
-        experiment_name = data.get('experiment_name')
-        class_id = data.get('class_id')
-        description = data.get('description')
-        deadline = data.get('deadline')
-        attachment_ids = data.get('attachment_ids', [])
+        # 获取表单参数
+        experiment_name = request.form.get('experiment_name')
+        class_id = request.form.get('class_id', type=int)
+        teacher_id = request.form.get('teacher_id', type=int)
+        description = request.form.get('description')
+        deadline = request.form.get('deadline')
+        file = request.files.get('file')
+
+        # 参数校验
         if not experiment_name:
-            return jsonify({'code': 400, 'message': '参数错误：实验名称不能为空'}), 400
+            return jsonify({'code': 400, 'message': '实验名称不能为空'}), 400
         if not class_id:
-            return jsonify({'code': 400, 'message': '参数错误：班级ID不能为空'}), 400
+            return jsonify({'code': 400, 'message': '班级ID不能为空'}), 400
+        if not teacher_id:
+            return jsonify({'code': 400, 'message': '教师ID不能为空'}), 400
         if not description:
-            return jsonify({'code': 400, 'message': '参数错误：实验描述不能为空'}), 400
+            return jsonify({'code': 400, 'message': '实验描述不能为空'}), 400
+        if not file or not file.filename:
+            return jsonify({'code': 400, 'message': '未选择文件'}), 400
+
+        # 检查班级是否存在
         class_obj = Class.query.get(class_id)
         if not class_obj:
             return jsonify({'code': 404, 'message': '班级不存在'}), 404
-        teacher_id = 1  # TODO: 实际项目应从登录信息获取
+
+        # 处理截止时间
         deadline_time = None
         if deadline:
             try:
                 deadline_time = datetime.strptime(deadline, '%Y-%m-%d %H:%M:%S')
             except ValueError:
-                return jsonify({'code': 400, 'message': '参数错误：截止时间格式不正确'}), 400
+                return jsonify({'code': 400, 'message': '截止时间格式不正确'}), 400
+
+        # 插入实验表
         experiment = Experiment(
             experiment_name=experiment_name,
             class_id=class_id,
@@ -221,22 +231,40 @@ def publish_experiment():
             deadline=deadline_time
         )
         db.session.add(experiment)
-        db.session.flush()  # 获取experiment_id
-        # 绑定附件
-        if attachment_ids:
-            attachments = ExperimentAttachment.query.filter(ExperimentAttachment.attachment_id.in_(attachment_ids)).all()
-            for attachment in attachments:
-                attachment.experiment_id = experiment.experiment_id
+        db.session.flush()  # 获取 experiment_id
+
+        # 保存附件
+        filename = secure_filename(file.filename)
+        file_extension = os.path.splitext(filename)[1]
+        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        save_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        file.save(save_path)
+        file_size = os.path.getsize(save_path) // 1024  # KB
+
+        # 插入附件表
+        attachment = ExperimentAttachment(
+            experiment_id=experiment.experiment_id,
+            file_name=filename,
+            file_path=save_path,
+            file_size=file_size
+        )
+        db.session.add(attachment)
         db.session.commit()
+
         return jsonify({
             'code': 200,
             'message': '发布成功',
-            'data': {'experiment_id': experiment.experiment_id}
+            'data': {
+                'experiment_id': experiment.experiment_id,
+                'attachment_id': attachment.attachment_id,
+                'file_name': attachment.file_name,
+                'file_size': attachment.file_size,
+                'upload_time': attachment.upload_time.strftime('%Y-%m-%d %H:%M:%S')
+            }
         })
     except Exception as e:
         db.session.rollback()
         return jsonify({'code': 500, 'message': f'服务器错误：{str(e)}'}), 500
-
 
 # 测试接口
 @app.route('/')
