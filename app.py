@@ -5,8 +5,13 @@ from datetime import datetime
 import base64
 import os
 import uuid
+import pymysql
 from config import config
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# 注册pymysql作为MySQL的驱动
+pymysql.install_as_MySQLdb()
 
 app = Flask(__name__)
 CORS(app)
@@ -30,6 +35,10 @@ class User(db.Model):
     profile_completed = db.Column(db.Boolean, nullable=True)
     class_id = db.Column(db.Integer, nullable=True)
     email = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    def __repr__(self):
+        return f'<User {self.username}>'
 
 class Class(db.Model):
     __tablename__ = 'classes'
@@ -82,27 +91,13 @@ def internal_error(error):
 @app.route('/student/experiment/requirements', methods=['GET'])
 def get_experiment_requirements():
     try:
-        # 获取请求参数
         experiment_id = request.args.get('experiment_id')
-        
         if not experiment_id:
-            return jsonify({
-                'code': 400,
-                'message': '参数错误：实验ID不能为空'
-            }), 400
-        
-        # 查询实验信息
+            return jsonify({'code': 400, 'message': '参数错误：实验ID不能为空'}), 400
         experiment = Experiment.query.get(experiment_id)
         if not experiment:
-            return jsonify({
-                'code': 404,
-                'message': '实验不存在'
-            }), 404
-        
-        # 查询附件信息
+            return jsonify({'code': 404, 'message': '实验不存在'}), 404
         attachments = ExperimentAttachment.query.filter_by(experiment_id=experiment_id).all()
-        
-        # 构建响应数据
         attachment_list = []
         for attachment in attachments:
             attachment_list.append({
@@ -111,7 +106,6 @@ def get_experiment_requirements():
                 'file_size': attachment.file_size,
                 'upload_time': attachment.upload_time.strftime('%Y-%m-%d %H:%M:%S')
             })
-        
         response_data = {
             'experiment_name': experiment.experiment_name,
             'description': experiment.description,
@@ -119,20 +113,11 @@ def get_experiment_requirements():
             'deadline': experiment.deadline.strftime('%Y-%m-%d %H:%M:%S') if experiment.deadline else None,
             'attachments': attachment_list
         }
-        
-        return jsonify({
-            'code': 200,
-            'message': '获取成功',
-            'data': response_data
-        })
-        
+        return jsonify({'code': 200, 'message': '获取成功', 'data': response_data})
     except Exception as e:
-        return jsonify({
-            'code': 500,
-            'message': f'服务器错误：{str(e)}'
-        }), 500
+        return jsonify({'code': 500, 'message': f'服务器错误：{str(e)}'}), 500
 
-#下载实验附件接口
+# 下载实验附件接口
 @app.route('/download/attachment/<int:attachment_id>', methods=['GET'])
 def download_attachment(attachment_id):
     attachment = ExperimentAttachment.query.get(attachment_id)
@@ -153,19 +138,15 @@ def upload_attachment():
         return jsonify({'code': 400, 'message': '文件名不能为空'}), 400
     if not experiment_id:
         return jsonify({'code': 400, 'message': 'experiment_id不能为空'}), 400
-
-    # 检查实验是否存在
     experiment = Experiment.query.get(experiment_id)
     if not experiment:
         return jsonify({'code': 404, 'message': '实验不存在'}), 404
-
     filename = secure_filename(file.filename)
     file_extension = os.path.splitext(filename)[1]
     unique_filename = f"{uuid.uuid4()}{file_extension}"
     save_path = os.path.join(UPLOAD_FOLDER, unique_filename)
     file.save(save_path)
     file_size = os.path.getsize(save_path) // 1024  # KB
-
     attachment = ExperimentAttachment(
         experiment_id=experiment_id,
         file_name=filename,
@@ -185,19 +166,16 @@ def upload_attachment():
         }
     })
 
-#教师端发布实验接口
+# 教师端发布实验接口
 @app.route('/teacher/experiment/publish_with_attachment', methods=['POST'])
 def publish_experiment_with_attachment():
     try:
-        # 获取表单参数
         experiment_name = request.form.get('experiment_name')
         class_id = request.form.get('class_id', type=int)
         teacher_id = request.form.get('teacher_id', type=int)
         description = request.form.get('description')
         deadline = request.form.get('deadline')
         file = request.files.get('file')
-
-        # 参数校验
         if not experiment_name:
             return jsonify({'code': 400, 'message': '实验名称不能为空'}), 400
         if not class_id:
@@ -208,21 +186,15 @@ def publish_experiment_with_attachment():
             return jsonify({'code': 400, 'message': '实验描述不能为空'}), 400
         if not file or not file.filename:
             return jsonify({'code': 400, 'message': '未选择文件'}), 400
-
-        # 检查班级是否存在
         class_obj = Class.query.get(class_id)
         if not class_obj:
             return jsonify({'code': 404, 'message': '班级不存在'}), 404
-
-        # 处理截止时间
         deadline_time = None
         if deadline:
             try:
                 deadline_time = datetime.strptime(deadline, '%Y-%m-%d %H:%M:%S')
             except ValueError:
                 return jsonify({'code': 400, 'message': '截止时间格式不正确'}), 400
-
-        # 插入实验表
         experiment = Experiment(
             experiment_name=experiment_name,
             class_id=class_id,
@@ -232,16 +204,12 @@ def publish_experiment_with_attachment():
         )
         db.session.add(experiment)
         db.session.flush()  # 获取 experiment_id
-
-        # 保存附件
         filename = secure_filename(file.filename)
         file_extension = os.path.splitext(filename)[1]
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         save_path = os.path.join(UPLOAD_FOLDER, unique_filename)
         file.save(save_path)
         file_size = os.path.getsize(save_path) // 1024  # KB
-
-        # 插入附件表
         attachment = ExperimentAttachment(
             experiment_id=experiment.experiment_id,
             file_name=filename,
@@ -250,7 +218,6 @@ def publish_experiment_with_attachment():
         )
         db.session.add(attachment)
         db.session.commit()
-
         return jsonify({
             'code': 200,
             'message': '发布成功',
@@ -270,6 +237,35 @@ def publish_experiment_with_attachment():
 @app.route('/')
 def hello_world():
     return 'hello world'
+
+# 注册接口
+@app.route('/register', methods=['POST'])
+def register():
+    try:
+        data = request.get_json()
+        required_fields = ['username', 'password', 'user_type', 'realname', 'email']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'code': 400, 'message': f'缺少必要字段: {field}'}), 400
+        existing_user = User.query.filter_by(username=data['username']).first()
+        if existing_user:
+            return jsonify({'code': 400, 'message': '用户名已存在'}), 400
+        existing_email = User.query.filter_by(email=data['email']).first()
+        if existing_email:
+            return jsonify({'code': 400, 'message': '邮箱已被使用'}), 400
+        new_user = User(
+            username=data['username'],
+            password=data['password'],
+            real_name=data['realname'],
+            email=data['email'],
+            user_type=data['user_type']
+        )
+        db.session.add(new_user)
+        db.session.commit()
+        return jsonify({'code': 200, 'message': '注册成功'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'code': 500, 'message': f'注册失败: {str(e)}'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
