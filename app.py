@@ -233,6 +233,23 @@ def publish_experiment_with_attachment():
         db.session.rollback()
         return jsonify({'code': 500, 'message': f'服务器错误：{str(e)}'}), 500
 
+# 查询所有实验接口
+@app.route('/experiments/list', methods=['GET'])
+def list_experiments():
+    try:
+        experiments = Experiment.query.all()
+        data = [
+            {
+                'experiment_id': exp.experiment_id,
+                'experiment_name': exp.experiment_name,
+                'deadline': exp.deadline.strftime('%Y-%m-%d %H:%M:%S') if exp.deadline else None
+            }
+            for exp in experiments
+        ]
+        return jsonify({'code': 200, 'message': '查询成功', 'data': data})
+    except Exception as e:
+        return jsonify({'code': 500, 'message': f'查询失败: {str(e)}'}), 500
+
 # 测试接口
 @app.route('/')
 def hello_world():
