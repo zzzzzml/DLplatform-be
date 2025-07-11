@@ -6,3 +6,6 @@ cryptography==41.0.7
 requests==2.31.0
 Werkzeug==2.0.1
 python-dotenv==0.19.0
+pyunpack==0.3.1
+patool==1.12
+pandas==2.0.3
