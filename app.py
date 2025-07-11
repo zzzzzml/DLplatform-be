@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import pymysql
 import sys
@@ -9,6 +9,8 @@ import base64
 from enum import Enum
 import shutil
 import zipfile
+import re
+import traceback
 try:
     from pyunpack import Archive
 except ImportError:
@@ -397,17 +399,217 @@ def insert_grade(submission_id, experiment_id, student_id, score, graded_by):
         db.session.rollback()
         return False
 
+# 邮箱验证函数（从修改个人资料分支引入）
+def validate_email(email):
+    """验证邮箱格式"""
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+def get_current_user():
+    """获取当前登录用户（简化处理，假设用户已登录）"""
+    # 从请求头中获取用户信息
+    user_id = request.headers.get('User-ID')
+    if not user_id:
+        # 如果没有提供User-ID，使用默认用户（假设已登录）
+        return User.query.first()
+    return User.query.get(int(user_id))
+
+def check_email_conflict(email, current_user_id):
+    """检查邮箱是否已被其他用户使用"""
+    existing_user = User.query.filter_by(email=email).first()
+    if existing_user and existing_user.user_id != current_user_id:
+        return existing_user.email
+    return None
+
+def check_student_id_conflict(student_id, current_user_id):
+    """检查学号是否已被其他用户使用"""
+    existing_user = User.query.filter_by(student_id=student_id).first()
+    if existing_user and existing_user.user_id != current_user_id:
+        return existing_user.student_id
+    return None
+
+# 路由
+# 修改个人资料接口
+@app.route('/profile/update', methods=['POST'])
+def update_profile():
+    """
+    更新用户个人资料
+    """
+    try:
+        # 获取当前用户
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({
+                'code': 500,
+                'message': '数据库没有用户，请先初始化'
+            }), 500
+
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'code': 400,
+                'message': '请求数据不能为空'
+            }), 400
+
+        real_name = data.get('real_name')
+        email = data.get('email')
+        student_id = data.get('student_id')
+        class_id = data.get('class_id')
+
+        # 角色权限检查
+        forbidden_fields = []
+        user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+        if user_type == 'teacher':
+            if student_id is not None:
+                forbidden_fields.append('student_id')
+            if class_id is not None:
+                forbidden_fields.append('class_id')
+        if forbidden_fields:
+            return jsonify({
+                'code': 403,
+                'message': '无权修改学号/班级信息',
+                'forbidden_fields': forbidden_fields
+            }), 403
+
+        # 邮箱格式校验
+        if email and not validate_email(email):
+            return jsonify({
+                'code': 400,
+                'message': '参数错误：邮箱格式不正确'
+            }), 400
+
+        # 邮箱冲突校验
+        if email:
+            conflict_email = check_email_conflict(email, current_user.user_id)
+            if conflict_email:
+                return jsonify({
+                    'code': 409,
+                    'message': '邮箱已被使用',
+                    'conflict_email': conflict_email
+                }), 409
+
+        # 学号冲突校验（仅学生）
+        if student_id and user_type == 'student':
+            conflict_student_id = check_student_id_conflict(student_id, current_user.user_id)
+            if conflict_student_id:
+                return jsonify({
+                    'code': 409,
+                    'message': '学号已被使用',
+                    'conflict_student_id': conflict_student_id
+                }), 409
+
+        # 班级存在性校验（仅学生，且有class_id时）
+        if class_id and user_type == 'student':
+            class_exists = Class.query.get(class_id)
+            if not class_exists:
+                return jsonify({
+                    'code': 404,
+                    'message': f'班级不存在，class_id: {class_id}'
+                }), 404
+
+        # 更新字段
+        if real_name is not None:
+            current_user.real_name = real_name
+        if email is not None:
+            current_user.email = email
+        if student_id is not None and user_type == 'student':
+            current_user.student_id = student_id
+        if class_id is not None and user_type == 'student':
+            current_user.class_id = class_id
+
+        db.session.commit()
+        update_time = datetime.now(timezone.utc)
+
+        return jsonify({
+            'code': 200,
+            'message': '资料更新成功',
+            'data': {
+                'update_time': update_time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        print("发生异常：", e)
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': '服务器内部错误，资料更新失败'
+        }), 500
+
+# 测试路由
+@app.route('/')
+def hello_world():
+    return 'Hello, Flask! 个人资料修改接口已就绪，后端服务已启动'
+
 # 初始化数据库接口
 @app.route('/init-db', methods=['GET'])
 def init_db():
+    """初始化数据库表"""
     try:
         with app.app_context():
             db.create_all()
+        
+        print("检查数据库表...")
+        
+        # 检查是否已有数据
+        existing_classes = Class.query.count()
+        existing_users = User.query.count()
+        
+        print(f"现有班级数量: {existing_classes}")
+        print(f"现有用户数量: {existing_users}")
+        
+        # 先创建用户数据（因为班级表需要引用教师）
+        if existing_users == 0:
+            print("开始创建用户数据...")
+            user1 = User(
+                username='student1',
+                real_name='张三',
+                email='zhangsan@example.com',
+                student_id='2025001',
+                user_type=UserType.STUDENT,
+                password='123456'
+            )
+            user2 = User(
+                username='teacher1',
+                real_name='李老师',
+                email='teacher@example.com',
+                user_type=UserType.TEACHER,
+                password='123456'
+            )
+            db.session.add(user1)
+            db.session.add(user2)
+            db.session.commit()
+            print("用户数据创建成功")
+        
+        # 再创建班级数据（引用已存在的教师）
+        if existing_classes == 0:
+            print("开始创建班级数据...")
+            # 获取教师用户ID
+            teacher = User.query.filter_by(user_type=UserType.TEACHER).first()
+            if teacher:
+                class1 = Class(class_name='计算机科学1班', teacher_id=teacher.user_id)
+                class2 = Class(class_name='计算机科学2班', teacher_id=teacher.user_id)
+                db.session.add(class1)
+                db.session.add(class2)
+                db.session.commit()
+                print("班级数据创建成功")
+                
+                # 更新学生用户的班级ID
+                student = User.query.filter_by(user_type=UserType.STUDENT).first()
+                if student:
+                    student.class_id = class1.class_id
+                    db.session.commit()
+                    print("学生班级关联成功")
+        
         return jsonify({
             'code': 200,
             'message': '数据库初始化成功'
-        })
+        }), 200
+        
     except Exception as e:
+        print("数据库初始化异常：", e)
+        traceback.print_exc()
         return jsonify({
             'code': 500,
             'message': f'数据库初始化失败: {str(e)}'
@@ -1081,10 +1283,6 @@ def internal_error(error):
         'message': '服务器内部错误'
     }), 500
 
-@app.route('/')
-def index():
-    return '后端服务已启动'
-
 def init_database():
     """初始化数据库"""
     try:
@@ -1102,12 +1300,16 @@ def run_app():
     
     # 启动应用
     print("启动Flask应用...")
+    print("访问地址: http://localhost:5000")
+    print("个人资料修改接口: POST http://localhost:5000/profile/update")
+    print("数据库初始化: http://localhost:5000/init-db")
+    print("\n按 Ctrl+C 停止应用")
+    
     app.run(
         host='0.0.0.0',
         port=5000,
         debug=True
     )
-
 
 if __name__ == '__main__':
     run_app()
