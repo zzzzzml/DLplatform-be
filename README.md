@@ -30,6 +30,11 @@ python app.py
 
 ## API 文档
 
+### 系统接口
+- 路径: `/init-db`
+- 方法: `GET`
+- 描述: 初始化数据库表
+
 ### 注册接口
 - 路径: `/register`
 - 方法: `POST`
@@ -68,23 +73,24 @@ python app.py
 - 示例: `GET /student/experiment/requirements?experiment_id=1`
 
 ### 教师端接口
-#### 发布实验要求（带附件）
-- URL: `/teacher/experiment/publish_with_attachment`
+#### 发布实验要求
+- URL: `/teacher/experiment/publish`
 - 方法: POST
-- 请求体: `multipart/form-data`，包含：
-    - experiment_name: 实验名称
-    - class_id: 班级ID
-    - teacher_id: 教师ID
-    - description: 实验描述
-    - deadline: 截止时间（可选，格式：2024-02-01 23:59:59）
-    - file: 附件文件
-
-#### 上传实验附件
-- URL: `/teacher/experiment/upload_attachment`
-- 方法: POST
-- 请求体: `multipart/form-data`，包含：
-    - experiment_id: 实验ID
-    - file: 附件文件
+- 请求体: JSON格式
+```json
+{
+    "experiment_name": "实验名称",
+    "class_id": 1,
+    "description": "实验详细要求",
+    "deadline": "2024-12-31 23:59:59",
+    "attachments": [
+        {
+            "file_name": "文件名.txt",
+            "file_content": "base64编码的文件内容"
+        }
+    ]
+}
+```
 
 #### 下载实验附件
 - URL: `/download/attachment/<attachment_id>`
@@ -107,40 +113,28 @@ python app.py
 ### 班级表 (classes)
 - class_id: 班级ID
 - class_name: 班级名称
-- teacher_id: 教师ID
 
 ### 实验表 (experiments)
 - experiment_id: 实验ID
 - experiment_name: 实验名称
 - class_id: 所属班级
-- teacher_id: 发布教师
 - description: 实验要求
-- publish_time: 发布时间
 - deadline: 截止时间
+- created_at: 创建时间
 
 ### 实验附件表 (experiment_attachments)
 - attachment_id: 附件ID
 - experiment_id: 关联实验
 - file_name: 文件名
 - file_path: 存储路径
-- file_size: 文件大小(KB)
-- upload_time: 上传时间
+- created_at: 创建时间
 
 ## 文件结构
 ```
 DLplatform-be/
-├── app.py              # 主应用文件
-├── config.py           # 配置文件
-├── run.py              # 启动脚本
-├── test_api.py         # API测试脚本
+├── app.py              # 主应用文件（包含数据库连接、模型和API）
 ├── requirements.txt    # 依赖项
 ├── README.md           # 说明文档
 └── uploads/            # 文件上传目录
+    └── experiments/    # 实验附件目录
 ```
-
-## 测试
-运行测试脚本来验证API功能：
-```bash
-python test_api.py
-```
-确保在运行测试前，Flask应用已经启动。
