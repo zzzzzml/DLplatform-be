@@ -23,6 +23,7 @@ from contextlib import redirect_stdout, redirect_stderr
 import io
 import numpy as np
 import importlib.util
+import random
 
 # 创建Flask应用
 app = Flask(__name__)
@@ -3467,6 +3468,421 @@ def student_dashboard_stats():
         })
     except Exception as e:
         print(f"获取学生首页统计数据错误: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': f'服务器内部错误: {str(e)}'
+        }), 500
+
+@app.route('/teacher/experiment/upload-testdata', methods=['POST'])
+def upload_experiment_testdata():
+    """
+    上传实验测试数据（教师端）
+    """
+    try:
+        # 获取当前登录用户
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({
+                'code': 401,
+                'message': '未登录或登录已过期'
+            }), 401
+        
+        # 确保是教师用户
+        user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+        if user_type != 'teacher':
+            return jsonify({
+                'code': 403,
+                'message': '只有教师可以上传测试数据'
+            }), 403
+        
+        # 获取实验ID
+        experiment_id = request.form.get('experiment_id')
+        if not experiment_id:
+            return jsonify({
+                'code': 400,
+                'message': '缺少实验ID'
+            }), 400
+        
+        # 检查实验是否存在
+        experiment = Experiment.query.get(experiment_id)
+        if not experiment:
+            return jsonify({
+                'code': 404,
+                'message': '实验不存在'
+            }), 404
+        
+        # 确保当前教师是该实验的创建者
+        if experiment.teacher_id != current_user.user_id:
+            return jsonify({
+                'code': 403,
+                'message': '您没有权限为此实验上传测试数据'
+            }), 403
+        
+        # 检查是否有文件上传
+        if 'file' not in request.files:
+            return jsonify({
+                'code': 400,
+                'message': '未上传文件'
+            }), 400
+        
+        file = request.files['file']
+        
+        # 检查文件名
+        if file.filename == '':
+            return jsonify({
+                'code': 400,
+                'message': '未选择文件'
+            }), 400
+        
+        # 检查文件类型
+        if not file.filename.lower().endswith('.zip'):
+            return jsonify({
+                'code': 400,
+                'message': '只支持ZIP格式的测试数据文件'
+            }), 400
+        
+        # 获取实验对应的lab文件夹
+        lab_name = f"lab{experiment_id}"  # 假设实验ID对应lab文件夹名称
+        
+        # 确保testdata文件夹存在（而不是testcode）
+        # 使用后端目录下的实验文件夹，而不是当前工作目录
+        backend_dir = os.path.dirname(os.path.abspath(__file__))  # 获取后端目录的绝对路径
+        testdata_dir = os.path.join(backend_dir, lab_name, 'testdata')
+        os.makedirs(testdata_dir, exist_ok=True)
+        
+        # 保存上传的文件到临时位置
+        temp_zip_path = os.path.join(testdata_dir, 'temp_testdata.zip')
+        file.save(temp_zip_path)
+        
+        # 解压文件到testdata文件夹
+        try:
+            import zipfile
+            with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
+                zip_ref.extractall(testdata_dir)
+            
+            # 删除临时ZIP文件
+            if os.path.exists(temp_zip_path):
+                os.remove(temp_zip_path)
+            
+            return jsonify({
+                'code': 200,
+                'message': '测试数据上传并解压成功',
+                'data': {
+                    'experiment_id': experiment_id,
+                    'testdata_dir': testdata_dir
+                }
+            })
+        except Exception as e:
+            # 如果解压失败，删除临时文件
+            if os.path.exists(temp_zip_path):
+                os.remove(temp_zip_path)
+            
+            print(f"解压测试数据失败: {str(e)}")
+            return jsonify({
+                'code': 500,
+                'message': f'测试数据解压失败: {str(e)}'
+            }), 500
+        
+    except Exception as e:
+        print(f"上传测试数据错误: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': f'服务器内部错误: {str(e)}'
+        }), 500
+
+@app.route('/teacher/experiment/check-plagiarism', methods=['POST'])
+def check_plagiarism():
+    """
+    查重模块接口
+    根据实验ID，查找所有提交的pth模型文件，进行二进制查重并返回结果
+    """
+    try:
+        # 获取当前登录用户
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({
+                'code': 401,
+                'message': '未登录或登录已过期'
+            }), 401
+        
+        # 确保是教师用户
+        user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+        if user_type != 'teacher':
+            return jsonify({
+                'code': 403,
+                'message': '只有教师可以进行查重'
+            }), 403
+        
+        # 获取实验ID参数
+        data = request.get_json()
+        experiment_id = data.get('experiment_id')
+        print(f"开始查重实验 ID: {experiment_id}")
+        
+        if not experiment_id:
+            return jsonify({
+                'code': 400,
+                'message': '缺少实验ID参数'
+            }), 400
+        
+        # 验证实验是否存在
+        experiment = Experiment.query.get(experiment_id)
+        if not experiment:
+            return jsonify({
+                'code': 400,
+                'message': '实验不存在'
+            }), 400
+        
+        # 验证当前教师是否有权限查重该实验
+        if experiment.teacher_id != current_user.user_id:
+            return jsonify({
+                'code': 403,
+                'message': '您没有权限对此实验进行查重'
+            }), 403
+        
+        # 获取该实验的所有提交记录
+        submissions = Submission.query.filter_by(
+            experiment_id=experiment_id
+        ).all()
+        
+        if not submissions:
+            return jsonify({
+                'code': 400,
+                'message': '该实验暂无提交记录'
+            }), 400
+        
+        print(f"开始查重，共有{len(submissions)}个提交记录")
+        
+        # 创建一个字典，用于存储每个学生的pth文件路径
+        student_pth_files = {}
+        
+        # 查找每个提交中的pth文件
+        for submission in submissions:
+            student_id = submission.student_id
+            student_folder_path = submission.file_path
+            
+            if not os.path.exists(student_folder_path) or not os.path.isdir(student_folder_path):
+                print(f"学生{student_id}提交文件夹不存在: {student_folder_path}")
+                continue
+            
+            # 在提交文件夹中查找pth文件
+            pth_files = []
+            for root, dirs, files in os.walk(student_folder_path):
+                for file in files:
+                    if file.endswith('.pth'):
+                        pth_files.append(os.path.join(root, file))
+            
+            if pth_files:
+                # 如果找到多个pth文件，使用第一个
+                student_pth_files[student_id] = pth_files[0]
+                print(f"找到学生{student_id}的pth文件: {pth_files[0]}")
+            else:
+                print(f"学生{student_id}的提交中没有找到pth文件")
+        
+        # 如果没有找到任何pth文件，返回错误
+        if not student_pth_files:
+            return jsonify({
+                'code': 400,
+                'message': '未找到任何pth文件进行查重'
+            }), 400
+        
+        # 计算文件相似度的函数
+        def calculate_similarity(file1, file2):
+            try:
+                # 读取文件二进制内容
+                with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
+                    content1 = f1.read()
+                    content2 = f2.read()
+                
+                # 如果文件大小相差太多，相似度应该较低
+                size1 = len(content1)
+                size2 = len(content2)
+                
+                # 如果文件大小相差超过20%，降低基础相似度
+                if abs(size1 - size2) > 0.2 * max(size1, size2):
+                    base_similarity = 30  # 基础相似度降低
+                else:
+                    base_similarity = 50  # 文件大小相近，基础相似度较高
+                
+                # 比较文件头部和尾部（通常包含元数据和模型架构信息）
+                # 头部比较 - 取前2KB
+                head_size = min(2048, min(size1, size2))
+                head1 = content1[:head_size]
+                head2 = content2[:head_size]
+                
+                # 计算头部相似度 - 使用分块比较方法
+                head_similarity = 0
+                block_size = 64  # 64字节一个块
+                for i in range(0, head_size, block_size):
+                    block1 = head1[i:i+block_size]
+                    block2 = head2[i:i+block_size]
+                    # 计算块内相同字节的比例
+                    if block1 == block2:
+                        head_similarity += 1
+                
+                head_similarity = (head_similarity * block_size / head_size) * 100 if head_size > 0 else 0
+                
+                # 尾部比较 - 取后1KB
+                tail_size = min(1024, min(size1, size2))
+                tail1 = content1[-tail_size:] if size1 >= tail_size else content1
+                tail2 = content2[-tail_size:] if size2 >= tail_size else content2
+                
+                # 计算尾部相似度
+                tail_similarity = 0
+                for i in range(0, tail_size, block_size):
+                    block1 = tail1[i:i+block_size]
+                    block2 = tail2[i:i+block_size]
+                    if block1 == block2:
+                        tail_similarity += 1
+                
+                tail_similarity = (tail_similarity * block_size / tail_size) * 100 if tail_size > 0 else 0
+                
+                # 抽样比较文件中间部分
+                # 选择多个位置进行抽样比较
+                samples = 10
+                middle_similarity = 0
+                
+                for _ in range(samples):
+                    # 随机选择一个位置，但避开头尾
+                    min_pos = head_size
+                    max_pos = min(size1, size2) - tail_size - block_size
+                    
+                    if max_pos <= min_pos:
+                        # 文件太小，无法进行中间部分抽样
+                        continue
+                    
+                    pos = random.randint(min_pos, max_pos)
+                    sample1 = content1[pos:pos+block_size]
+                    sample2 = content2[pos:pos+block_size]
+                    
+                    if sample1 == sample2:
+                        middle_similarity += 1
+                
+                middle_similarity = (middle_similarity / samples) * 100
+                
+                # 计算总相似度 - 头部权重高，因为包含模型架构信息
+                # 尾部权重次之，中间部分权重最低
+                weighted_similarity = (head_similarity * 0.5) + (tail_similarity * 0.3) + (middle_similarity * 0.2)
+                
+                # 应用基础相似度调整
+                final_similarity = base_similarity + (weighted_similarity * 0.5)
+                
+                # 确保相似度在0-100范围内
+                final_similarity = max(0, min(100, final_similarity))
+                
+                print(f"文件相似度计算 - 大小相似度: {base_similarity}, 头部: {head_similarity:.2f}%, 尾部: {tail_similarity:.2f}%, 中间: {middle_similarity:.2f}%, 最终: {final_similarity:.2f}%")
+                
+                return final_similarity
+            except Exception as e:
+                print(f"计算文件相似度时出错: {str(e)}")
+                return 0
+        
+        # 获取风险级别
+        def get_risk_level(similarity):
+            if similarity >= 80:
+                return "极高风险"
+            elif similarity >= 70:
+                return "高风险"
+            elif similarity >= 60:
+                return "中等风险"
+            else:
+                return "低风险"
+        
+        # 存储查重结果
+        plagiarism_results = []
+        
+        # 对每个学生的pth文件进行两两比较
+        student_ids = list(student_pth_files.keys())
+        for i, student_id1 in enumerate(student_ids):
+            # 获取学生信息
+            student1 = User.query.get(student_id1)
+            student_name1 = student1.real_name or student1.username if student1 else f"学生ID: {student_id1}"
+            
+            # 存储该学生与其他学生的最高相似度
+            highest_similarity = 0
+            highest_similarity_with = None
+            highest_similarity_name = None
+            
+            # 存储所有相似度结果，用于调试
+            all_similarities = []
+            
+            for j, student_id2 in enumerate(student_ids):
+                if i == j:  # 跳过自己
+                    continue
+                
+                # 获取学生2的信息
+                student2 = User.query.get(student_id2)
+                student_name2 = student2.real_name or student2.username if student2 else f"学生ID: {student_id2}"
+                
+                # 计算两个文件的相似度
+                similarity = calculate_similarity(student_pth_files[student_id1], student_pth_files[student_id2])
+                
+                # 记录所有相似度结果
+                all_similarities.append({
+                    "with_student_id": student_id2,
+                    "with_student_name": student_name2,
+                    "similarity": similarity
+                })
+                
+                # 如果相似度更高，更新记录
+                if similarity > highest_similarity:
+                    highest_similarity = similarity
+                    highest_similarity_with = student_id2
+                    highest_similarity_name = student_name2
+            
+            # 输出调试信息
+            print(f"学生 {student_name1} (ID: {student_id1}) 的相似度结果:")
+            for sim in sorted(all_similarities, key=lambda x: x['similarity'], reverse=True)[:3]:
+                print(f"  - 与 {sim['with_student_name']} (ID: {sim['with_student_id']}) 的相似度: {sim['similarity']:.2f}%")
+            
+            # 添加到结果列表
+            plagiarism_results.append({
+                'student_id': student_id1,
+                'student_name': student_name1,
+                'highest_similarity': round(highest_similarity, 2),
+                'similar_with_id': highest_similarity_with,
+                'similar_with_name': highest_similarity_name,
+                'risk_level': get_risk_level(highest_similarity)
+            })
+        
+        # 按相似度降序排序
+        plagiarism_results.sort(key=lambda x: x['highest_similarity'], reverse=True)
+        
+        # 更新学生成绩，将查重结果作为评论添加到成绩中
+        for result in plagiarism_results:
+            student_id = result['student_id']
+            similarity = result['highest_similarity']
+            similar_with = result['similar_with_name']
+            
+            # 查找该学生的提交记录
+            submission = Submission.query.filter_by(
+                experiment_id=experiment_id,
+                student_id=student_id
+            ).first()
+            
+            if submission:
+                # 查找是否已有成绩
+                grade = Grade.query.filter_by(submission_id=submission.submission_id).first()
+                
+                if grade:
+                    # 更新成绩评论，添加查重信息
+                    grade.comment = f"查重结果: 与{similar_with}的相似度为{similarity}%"
+                    db.session.commit()
+                    print(f"已更新学生{student_id}的成绩评论，添加查重信息")
+        
+        return jsonify({
+            'code': 200,
+            'message': '查重完成',
+            'data': {
+                'checked_count': len(plagiarism_results),
+                'total_submissions': len(submissions),
+                'results': plagiarism_results
+            }
+        })
+        
+    except Exception as e:
+        print(f"查重过程中出错: {str(e)}")
         traceback.print_exc()
         return jsonify({
             'code': 500,
