@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from datetime import datetime, timezone
@@ -21,18 +21,37 @@ except ImportError:
     print("警告：pandas未安装，模型评测功能将不可用")
 from contextlib import redirect_stdout, redirect_stderr
 import io
+import numpy as np
+import importlib.util
 
 # 创建Flask应用
 app = Flask(__name__)
 
 # 配置CORS
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
+CORS(app, resources={
+    r"/api/*": {"origins": "http://localhost:5173"},
+    r"/download/*": {"origins": "http://localhost:5173"},
+    r"/experiments/*": {"origins": "http://localhost:5173"},
+    r"/student/*": {"origins": "http://localhost:5173"},
+    r"/teacher/*": {"origins": "http://localhost:5173"},
+    r"/classes/*": {"origins": "http://localhost:5173"},
+    r"/profile/*": {"origins": "http://localhost:5173"},
+    r"/users/*": {"origins": "http://localhost:5173"},
+    r"/login": {"origins": "http://localhost:5173"},
+    r"/register": {"origins": "http://localhost:5173"},
+    r"/health": {"origins": "http://localhost:5173"},
+    r"/init-db": {"origins": "http://localhost:5173"},
+    r"/evaluations": {"origins": "http://localhost:5173"},
+    r"/results": {"origins": "http://localhost:5173"},
+    r"/test": {"origins": "http://localhost:5173"},
+    r"/auth/*": {"origins": "http://localhost:5173"}
+}, supports_credentials=True)
 
 # 简单的CORS支持
 @app.after_request
 def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    # 不再添加Access-Control-Allow-Origin，因为已经由flask-cors处理
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,User-ID,User-Type')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
@@ -100,9 +119,9 @@ class User(db.Model):
             'user_type': self.user_type.value if isinstance(self.user_type, UserType) else self.user_type,
             'real_name': self.real_name,
             'student_id': self.student_id,
-            'profile_completed': self.profile_completed,
             'class_id': self.class_id,
             'email': self.email,
+            'profile_completed': self.profile_completed,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
@@ -279,7 +298,8 @@ def execute_student_code(student_code_path):
         app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         # 构建绝对路径
-        absolute_student_code_path = os.path.join(app_root, student_code_path)
+        absolute_student_code_path = os.path.abspath(student_code_path)
+        print(f"评测文件绝对路径: {absolute_student_code_path}")
         
         # 检查文件是否存在
         if not os.path.exists(absolute_student_code_path):
@@ -288,8 +308,10 @@ def execute_student_code(student_code_path):
                 "message": f"学生代码文件不存在: {absolute_student_code_path}"
             }
         
-        # 获取学生代码所在目录
+        # 获取学生代码所在目录和模块名称
         student_dir = os.path.dirname(absolute_student_code_path)
+        module_name = os.path.basename(absolute_student_code_path).replace('.py', '')
+        print(f"模块名称: {module_name}, 目录: {student_dir}")
         
         # 切换到学生代码目录
         original_cwd = os.getcwd()
@@ -301,21 +323,47 @@ def execute_student_code(student_code_path):
         
         try:
             with redirect_stdout(output), redirect_stderr(error_output):
-                # 直接执行学生代码文件，模拟__main__环境
-                with open(absolute_student_code_path, 'r', encoding='utf-8') as f:
-                    code = f.read()
+                # 动态导入学生的模块
+                print(f"正在导入学生模块: {module_name}")
+                spec = importlib.util.spec_from_file_location(module_name, absolute_student_code_path)
+                if not spec:
+                    return {"score": 0.0, "message": f"无法加载模块规范: {module_name}"}
                 
-                # 创建一个新的命名空间来执行代码，模拟__main__环境
-                namespace = {'__name__': '__main__'}
-                exec(code, namespace)
+                student_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(student_module)
+                
+                print(f"模块导入成功，可用函数: {dir(student_module)}")
+                
+                # 首先尝试调用evaluate_model函数
+                if hasattr(student_module, 'evaluate_model') and callable(getattr(student_module, 'evaluate_model')):
+                    print("调用学生的evaluate_model函数...")
+                    student_module.evaluate_model()
+                # 如果没有evaluate_model函数，尝试调用其他可能的函数
+                elif hasattr(student_module, 'test') and callable(getattr(student_module, 'test')):
+                    print("调用学生的test函数...")
+                    student_module.test()
+                elif hasattr(student_module, 'predict') and callable(getattr(student_module, 'predict')):
+                    print("调用学生的predict函数...")
+                    student_module.predict()
+                else:
+                    print("未找到可调用的函数，尝试直接运行模块...")
+                    # 如果没有找到特定函数，模块导入时可能已经执行了主要代码
                 
                 # 检查是否生成了预测结果文件
-                if not os.path.exists('all_preds.csv'):
-                    # 如果没有生成文件，尝试直接调用evaluate_model函数
-                    if 'evaluate_model' in namespace and callable(namespace['evaluate_model']):
-                        print("找到evaluate_model函数，正在调用...")
-                        namespace['evaluate_model']()
-                    else:
+                preds_file = 'all_preds.csv'
+                if not os.path.exists(preds_file):
+                    # 尝试在当前目录和上级目录查找all_preds.csv文件
+                    found = False
+                    for search_dir in ['.', '..', '../..']:
+                        search_path = os.path.join(search_dir, 'all_preds.csv')
+                        if os.path.exists(search_path):
+                            print(f"在 {search_path} 找到预测结果文件")
+                            shutil.copy(search_path, 'all_preds.csv')
+                            found = True
+                            break
+                    
+                    if not found:
+                        print("未生成预测结果文件，评测失败")
                         return {"score": 0.0, "message": "学生代码中未找到evaluate_model函数且未生成预测结果"}
                 
                 # 检查是否生成了预测结果文件
@@ -324,19 +372,38 @@ def execute_student_code(student_code_path):
                     # 读取学生生成的预测结果
                     preds_df = pd.read_csv(preds_file)
                     predictions = preds_df.iloc[:, 0].tolist()
+                    print(f"读取到 {len(predictions)} 个预测结果")
                     
                     # 读取真实标签文件
+                    # 首先尝试相对于学生代码目录的路径
                     labels_file = '../../testdata/all_labels.csv'
+                    # 如果不存在，尝试相对于实验目录的路径
+                    if not os.path.exists(labels_file):
+                        # 从学生代码路径提取实验ID
+                        # 假设路径格式为 .../DLplatform-be/lab{experiment_id}/testcode/student_{student_id}_{timestamp}/...
+                        path_parts = absolute_student_code_path.split(os.sep)
+                        lab_index = -1
+                        for i, part in enumerate(path_parts):
+                            if part.startswith('lab'):
+                                lab_index = i
+                                break
+                        
+                        if lab_index >= 0:
+                            lab_dir = os.path.join(*path_parts[:lab_index+1])
+                            labels_file = os.path.join(lab_dir, 'testdata', 'all_labels.csv')
+                    
                     if os.path.exists(labels_file):
                         labels_df = pd.read_csv(labels_file)
                         true_labels = labels_df.iloc[:, 0].tolist()
-                        print('预测值：',predictions)
-                        print('真实值：',true_labels)
+                        print(f"读取到 {len(true_labels)} 个真实标签")
+                        
                         # 计算准确率
                         if len(predictions) == len(true_labels):
                             correct = sum(1 for pred, true in zip(predictions, true_labels) if pred == true)
                             total = len(true_labels)
                             accuracy = (correct / total) * 100
+                            
+                            print(f"评测结果: 总数 {total}, 正确 {correct}, 准确率 {accuracy:.2f}%")
                             
                             return {
                                 "score": round(accuracy, 2),
@@ -344,24 +411,36 @@ def execute_student_code(student_code_path):
                                 "correct": correct,
                                 "total": total,
                                 "predictions_count": len(predictions),
-                                "labels_count": len(true_labels)
+                                "labels_count": len(true_labels),
+                                "stdout": output.getvalue(),
+                                "stderr": error_output.getvalue()
                             }
                         else:
+                            print(f"预测结果数量({len(predictions)})与真实标签数量({len(true_labels)})不匹配")
                             return {
                                 "score": 0.0, 
-                                "message": f"预测结果数量({len(predictions)})与真实标签数量({len(true_labels)})不匹配"
+                                "message": f"预测结果数量({len(predictions)})与真实标签数量({len(true_labels)})不匹配",
+                                "predictions_count": len(predictions),
+                                "labels_count": len(true_labels),
+                                "stdout": output.getvalue(),
+                                "stderr": error_output.getvalue()
                             }
                     else:
+                        print(f"真实标签文件不存在: {labels_file}")
                         return {"score": 0.0, "message": f"真实标签文件不存在: {labels_file}"}
                 else:
+                    print(f"预测结果文件未生成: {preds_file}")
                     return {"score": 0.0, "message": f"预测结果文件未生成: {preds_file}"}
                     
         except Exception as e:
             error_msg = error_output.getvalue()
+            print(f"执行错误: {str(e)}")
+            print(f"错误输出: {error_msg}")
             return {
                 "score": 0.0, 
                 "message": f"执行学生代码时发生错误: {str(e)}",
-                "error_output": error_msg
+                "error_output": error_msg,
+                "stdout": output.getvalue()
             }
         finally:
             # 恢复原始工作目录
@@ -369,6 +448,7 @@ def execute_student_code(student_code_path):
             
     except Exception as e:
         print(f"执行学生代码时发生错误: {e}")
+        traceback.print_exc()
         return {"score": 0.0, "message": f"执行学生代码失败: {str(e)}"}
 
 def insert_grade(submission_id, experiment_id, student_id, score, graded_by):
@@ -406,13 +486,80 @@ def validate_email(email):
     return re.match(pattern, email) is not None
 
 def get_current_user():
-    """获取当前登录用户（简化处理，假设用户已登录）"""
+    """获取当前登录用户"""
     # 从请求头中获取用户信息
-    user_id = request.headers.get('User-ID')
-    if not user_id:
-        # 如果没有提供User-ID，使用默认用户（假设已登录）
-        return User.query.first()
-    return User.query.get(int(user_id))
+    auth_header = request.headers.get('Authorization')
+    user_id_header = request.headers.get('User-ID')
+    user_type_header = request.headers.get('User-Type')
+    user_id = None
+    
+    # 先尝试从User-ID头获取（优先级最高，兼容旧版本）
+    if user_id_header:
+        try:
+            user_id = int(user_id_header)
+            print(f"从User-ID头获取到用户ID: {user_id}")
+        except:
+            print("User-ID头解析失败")
+    
+    # 如果没有从User-ID获取到，尝试从Authorization头解析用户ID
+    if not user_id and auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        try:
+            # 尝试从token中提取user_id（简化处理）
+            if token.startswith('api_token_'):
+                # 从当前登录的Cookie获取user_id（如果有的话）
+                cookie_user_id = request.cookies.get('user_id')
+                if cookie_user_id:
+                    user_id = int(cookie_user_id)
+                    print(f"从Cookie获取到用户ID: {user_id}")
+            elif token.startswith('mock_token_'):
+                # 处理前端模拟用户的情况
+                if 'student' in token:
+                    student = User.query.filter_by(user_type=UserType.STUDENT).first()
+                    if student:
+                        print(f"使用模拟学生账号: {student.user_id}")
+                        return student
+                elif 'teacher' in token:
+                    teacher = User.query.filter_by(user_type=UserType.TEACHER).first()
+                    if teacher:
+                        print(f"使用模拟教师账号: {teacher.user_id}")
+                        return teacher
+        except Exception as e:
+            print(f"解析Authorization头失败: {e}")
+    
+    # 如果找到了user_id，查询对应用户
+    if user_id:
+        user = User.query.get(user_id)
+        if user:
+            print(f"找到用户: {user.user_id}, {user.username}")
+            
+            # 如果请求头中包含用户类型，且与数据库中的不一致，尝试更新用户类型
+            if user_type_header and user_type_header in ['student', 'teacher']:
+                current_type = user.user_type.value if isinstance(user.user_type, UserType) else user.user_type
+                if current_type != user_type_header:
+                    print(f"用户类型不匹配，请求头: {user_type_header}, 数据库: {current_type}")
+                    # 这里不直接修改数据库，而是临时调整返回的用户类型
+                    if user_type_header == 'teacher':
+                        # 如果请求头指定为教师，尝试查找教师账号
+                        teacher = User.query.filter_by(user_type=UserType.TEACHER).first()
+                        if teacher:
+                            print(f"切换到教师账号: {teacher.user_id}, {teacher.username}")
+                            return teacher
+            
+            return user
+        else:
+            print(f"找不到ID为{user_id}的用户")
+    
+    print("无法确定当前用户，尝试返回默认用户")
+    # 如果无法确定用户，尝试返回第一个用户（仅用于测试）
+    # 注意：实际生产环境应当返回None或抛出未授权错误
+    first_user = User.query.first()
+    if first_user:
+        print(f"使用默认用户: {first_user.user_id}, {first_user.username}")
+        return first_user
+    
+    print("找不到任何用户")
+    return None
 
 def check_email_conflict(email, current_user_id):
     """检查邮箱是否已被其他用户使用"""
@@ -430,11 +577,16 @@ def check_student_id_conflict(student_id, current_user_id):
 
 # 路由
 # 修改个人资料接口
-@app.route('/profile/update', methods=['POST'])
+@app.route('/profile/update', methods=['POST', 'OPTIONS'])
 def update_profile():
     """
     更新用户个人资料
     """
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+        
     try:
         # 获取当前用户
         current_user = get_current_user()
@@ -488,7 +640,7 @@ def update_profile():
                     'conflict_email': conflict_email
                 }), 409
 
-        # 学号冲突校验（仅学生）
+        # 学号冲突校验（仅对学生）
         if student_id and user_type == 'student':
             conflict_student_id = check_student_id_conflict(student_id, current_user.user_id)
             if conflict_student_id:
@@ -498,16 +650,23 @@ def update_profile():
                     'conflict_student_id': conflict_student_id
                 }), 409
 
-        # 班级存在性校验（仅学生，且有class_id时）
+        # 班级存在性校验（仅对学生）
         if class_id and user_type == 'student':
-            class_exists = Class.query.get(class_id)
-            if not class_exists:
+            try:
+                class_id = int(class_id)
+                class_obj = Class.query.get(class_id)
+                if not class_obj:
+                    return jsonify({
+                        'code': 404,
+                        'message': '班级不存在'
+                    }), 404
+            except (TypeError, ValueError):
                 return jsonify({
-                    'code': 404,
-                    'message': f'班级不存在，class_id: {class_id}'
-                }), 404
+                    'code': 400,
+                    'message': '参数错误：班级ID必须为整数'
+                }), 400
 
-        # 更新字段
+        # 更新用户信息
         if real_name is not None:
             current_user.real_name = real_name
         if email is not None:
@@ -517,25 +676,49 @@ def update_profile():
         if class_id is not None and user_type == 'student':
             current_user.class_id = class_id
 
-        db.session.commit()
-        update_time = datetime.now(timezone.utc)
+        # 检查资料是否已完善
+        profile_status_changed = False
+        if not current_user.profile_completed:
+            # 对于学生，检查是否已填写姓名、邮箱、学号和班级
+            if user_type == 'student':
+                if (current_user.real_name and current_user.email and
+                        current_user.student_id and current_user.class_id):
+                    current_user.profile_completed = True
+                    profile_status_changed = True
+            # 对于教师，检查是否已填写姓名和邮箱
+            elif user_type == 'teacher':
+                if current_user.real_name and current_user.email:
+                    current_user.profile_completed = True
+                    profile_status_changed = True
 
+        # 保存更改
+        db.session.commit()
+
+        # 返回结果
         return jsonify({
             'code': 200,
-            'message': '资料更新成功',
+            'message': '个人资料更新成功',
             'data': {
-                'update_time': update_time.strftime('%Y-%m-%d %H:%M:%S')
+                'profile_completed': current_user.profile_completed,
+                'profile_status_changed': profile_status_changed
             }
         }), 200
 
     except Exception as e:
         db.session.rollback()
-        print("发生异常：", e)
+        print("更新个人资料异常：", e)
         traceback.print_exc()
         return jsonify({
             'code': 500,
-            'message': '服务器内部错误，资料更新失败'
+            'message': '服务器内部错误，更新个人资料失败'
         }), 500
+
+# 处理所有路径的OPTIONS请求
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def options_handler(path):
+    response = app.make_default_options_response()
+    return response
 
 # 测试路由
 @app.route('/')
@@ -684,27 +867,53 @@ def register():
         }), 500
 
 # 获取用户信息接口
-@app.route('/user/<int:user_id>', methods=['GET'])
-def get_user(user_id):
-    try:
-        user = User.query.get(user_id)
-        if not user:
-            return jsonify({
-                'code': 404,
-                'message': '用户不存在'
-            }), 404
+@app.route('/auth/user-info', methods=['GET', 'OPTIONS'])
+def get_user_info():
+    """
+    获取当前登录用户信息
+    """
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
         
+    try:
+        # 获取当前用户
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({
+                'code': 401,
+                'message': '未登录或登录已过期'
+            }), 401
+
+        # 构建用户信息
+        user_info = {
+            'user_id': current_user.user_id,
+            'username': current_user.username,
+            'user_type': current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type,
+            'real_name': current_user.real_name,
+            'email': current_user.email,
+            'profile_completed': current_user.profile_completed,
+            'created_at': current_user.created_at.isoformat() if current_user.created_at else None
+        }
+
+        # 如果是学生，添加学生特有字段
+        if user_info['user_type'] == 'student':
+            user_info['student_id'] = current_user.student_id
+            user_info['class_id'] = current_user.class_id
+
         return jsonify({
             'code': 200,
-            'message': '获取成功',
-            'data': user.to_dict()
-        })
-        
+            'message': '获取用户信息成功',
+            'data': user_info
+        }), 200
+
     except Exception as e:
-        print(f"获取用户信息错误: {str(e)}")
+        print("获取用户信息异常：", e)
+        traceback.print_exc()
         return jsonify({
             'code': 500,
-            'message': '服务器内部错误'
+            'message': '服务器内部错误，获取用户信息失败'
         }), 500
 
 # 获取所有用户接口
@@ -765,6 +974,9 @@ def login():
                     'user_type': 'student',
                     'realname': user.real_name,
                     'email': user.email,
+                    'student_id': user.student_id,
+                    'class_id': user.class_id,
+                    'profile_completed': user.profile_completed,
                     'redirect_url': '/student/dashboard'
                 }
             }), 200
@@ -777,6 +989,7 @@ def login():
                     'user_type': 'teacher',
                     'realname': user.real_name,
                     'email': user.email,
+                    'profile_completed': True,  # 教师默认不需要强制完善资料
                     'redirect_url': '/teacher/verification'
                 }
             }), 200
@@ -793,45 +1006,70 @@ def login():
         }), 200
 
 # 获取实验要求
-@app.route('/student/experiment/requirements', methods=['GET'])
+@app.route('/student/experiment/requirements', methods=['GET', 'OPTIONS'])
 def get_experiment_requirements():
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+        
     try:
+        print("获取实验要求请求")
         experiment_id = request.args.get('experiment_id')
+        print(f"请求参数: experiment_id={experiment_id}")
         
         # 验证参数
         if not experiment_id:
+            print("缺少experiment_id参数")
             return jsonify({
                 'code': 400,
                 'message': '缺少experiment_id参数'
+            }), 400
+        
+        # 尝试将experiment_id转换为整数
+        try:
+            experiment_id = int(experiment_id)
+        except ValueError:
+            print(f"experiment_id不是有效的整数: {experiment_id}")
+            return jsonify({
+                'code': 400,
+                'message': 'experiment_id必须是整数'
             }), 400
             
         # 查询实验
         experiment = Experiment.query.get(experiment_id)
         if not experiment:
+            print(f"实验不存在: {experiment_id}")
             return jsonify({
                 'code': 404,
                 'message': '实验不存在'
             }), 404
             
+        print(f"找到实验: {experiment.experiment_name}")
+            
         # 查询附件
         attachments = ExperimentAttachment.query.filter_by(experiment_id=experiment_id).all()
+        print(f"找到附件数量: {len(attachments)}")
         attachments_data = [attachment.to_dict() for attachment in attachments]
             
         # 返回数据
-        return jsonify({
+        response_data = {
             'code': 200,
             'message': '获取成功',
             'data': {
                 'experiment': experiment.to_dict(),
                 'attachments': attachments_data
             }
-        })
+        }
+        print(f"返回数据: {response_data}")
+        return jsonify(response_data)
         
     except Exception as e:
         print(f"获取实验要求错误: {str(e)}")
+        traceback.print_exc()
         return jsonify({
             'code': 500,
-            'message': '服务器内部错误'
+            'message': f'服务器内部错误: {str(e)}'
         }), 500
 
 # 学生端获取成绩信息
@@ -909,92 +1147,13 @@ def teacher_experiment_scores():
 @app.route('/teacher/experiment/publish', methods=['POST'])
 def publish_experiment():
     try:
-        data = request.get_json()
-        
-        # 验证必需字段
-        required_fields = ['experiment_name', 'class_id', 'description', 'deadline', 'teacher_id']
-        for field in required_fields:
-            if field not in data or not data[field]:
-                return jsonify({
-                    'code': 400,
-                    'message': f'缺少必需字段: {field}'
-                }), 400
-                
-        # 创建实验
-        new_experiment = Experiment(
-            experiment_name=data['experiment_name'],
-            class_id=data['class_id'],
-            teacher_id=data['teacher_id'],
-            description=data['description'],
-            deadline=datetime.fromisoformat(data['deadline'].replace(' ', 'T'))
-        )
-        
-        db.session.add(new_experiment)
-        db.session.flush()  # 获取新实验ID
-        
-        # 处理附件
-        attachments_data = []
-        if 'attachments' in data and data['attachments']:
-            for attachment in data['attachments']:
-                if 'file_name' not in attachment or 'file_content' not in attachment:
-                    continue
-                    
-                # 保存文件（这里简化处理，实际应该保存到文件系统）
-                file_name = attachment['file_name']
-                file_path = f"uploads/experiments/{new_experiment.experiment_id}/{file_name}"
-                
-                # 确保目录存在
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                
-                # 解码base64并保存
-                file_content = base64.b64decode(attachment['file_content'])
-                with open(file_path, 'wb') as f:
-                    f.write(file_content)
-                
-                # 获取文件大小（KB）
-                file_size = os.path.getsize(file_path) // 1024
-                
-                # 创建附件记录
-                new_attachment = ExperimentAttachment(
-                    experiment_id=new_experiment.experiment_id,
-                    file_name=file_name,
-                    file_path=file_path,
-                    file_size=file_size
-                )
-                
-                db.session.add(new_attachment)
-                attachments_data.append(new_attachment.to_dict())
-        
-        db.session.commit()
-        
-        return jsonify({
-            'code': 200,
-            'message': '实验发布成功',
-            'data': {
-                'experiment': new_experiment.to_dict(),
-                'attachments': attachments_data
-            }
-        })
-        
-    except Exception as e:
-        db.session.rollback()
-        print(f"发布实验错误: {str(e)}")
-        return jsonify({
-            'code': 500,
-            'message': '服务器内部错误'
-        }), 500
-
-# 学生提交实验作业
-@app.route('/api/experiments/upload', methods=['POST'])
-def submit():
-    try:
         # 检查是否有文件
         if 'file' not in request.files:
             return jsonify({
                 'code': 400,
                 'message': '没有上传文件'
             }), 400
-        
+            
         file = request.files['file']
         
         # 检查文件名是否为空
@@ -1003,9 +1162,131 @@ def submit():
                 'code': 400,
                 'message': '没有选择文件'
             }), 400
+            
+        # 获取表单数据
+        experiment_name = request.form.get('experiment_name')
+        class_id = request.form.get('class_id')
+        teacher_id = request.form.get('teacher_id')
+        description = request.form.get('description')
+        requirements = request.form.get('requirements')
+        deadline = request.form.get('deadline')
+        
+        # 验证必需字段
+        if not experiment_name or not class_id or not teacher_id or not description or not deadline:
+            return jsonify({
+                'code': 400,
+                'message': '缺少必需字段'
+            }), 400
+            
+        # 验证班级是否存在
+        class_obj = Class.query.get(class_id)
+        if not class_obj:
+            return jsonify({
+                'code': 404,
+                'message': f'班级不存在，class_id: {class_id}'
+            }), 404
+            
+        # 创建实验
+        new_experiment = Experiment(
+            experiment_name=experiment_name,
+            class_id=int(class_id),
+            teacher_id=int(teacher_id),
+            description=description + (f"\n\n实验要求：\n{requirements}" if requirements else ""),
+            deadline=datetime.fromisoformat(deadline.replace(' ', 'T'))
+        )
+        
+        db.session.add(new_experiment)
+        db.session.flush()  # 获取新实验ID
+        
+        # 获取当前工作目录和后端目录
+        current_dir = os.getcwd()
+        backend_dir = os.path.join(current_dir, "DLplatform-be")
+        print(f"当前工作目录: {current_dir}")
+        print(f"后端目录: {backend_dir}")
+        
+        # 创建lab+experiment_id文件夹及其子文件夹，放在后端目录下
+        lab_folder = f"lab{new_experiment.experiment_id}"
+        lab_path = os.path.join(backend_dir, lab_folder)
+        testcode_folder = os.path.join(lab_path, "testcode")
+        testdata_folder = os.path.join(lab_path, "testdata")
+        upload_folder = os.path.join(lab_path, "upload")
+        
+        print(f"创建文件夹: {lab_path}")
+        
+        # 创建文件夹
+        os.makedirs(lab_path, exist_ok=True)
+        os.makedirs(testcode_folder, exist_ok=True)
+        os.makedirs(testdata_folder, exist_ok=True)
+        os.makedirs(upload_folder, exist_ok=True)
+        
+        # 保存文件到lab文件夹中的upload文件夹
+        file_path = os.path.join(upload_folder, file.filename)
+        file.save(file_path)
+        
+        print(f"文件保存到: {file_path}")
+        
+        # 获取文件大小（KB）
+        file_size = os.path.getsize(file_path) // 1024
+        
+        # 创建附件记录
+        new_attachment = ExperimentAttachment(
+            experiment_id=new_experiment.experiment_id,
+            file_name=file.filename,
+            file_path=file_path,
+            file_size=file_size
+        )
+        
+        db.session.add(new_attachment)
+        db.session.commit()
+        
+        return jsonify({
+            'code': 200,
+            'message': '实验发布成功',
+            'data': {
+                'experiment': new_experiment.to_dict(),
+                'attachment': new_attachment.to_dict()
+            }
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"发布实验错误: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': '服务器内部错误，发布实验失败'
+        }), 500
+
+# 学生提交实验作业
+@app.route('/api/experiments/upload', methods=['POST'])
+def submit():
+    try:
+        print("接收到实验提交请求")
+        print(f"请求表单数据: {request.form}")
+        print(f"请求文件: {request.files}")
+        
+        # 检查是否有文件
+        if 'file' not in request.files:
+            print("请求中没有文件")
+            return jsonify({
+                'code': 400,
+                'message': '没有上传文件'
+            }), 400
+        
+        file = request.files['file']
+        print(f"接收到文件: {file.filename}, 类型: {file.content_type}")
+        
+        # 检查文件名是否为空
+        if file.filename == '':
+            print("文件名为空")
+            return jsonify({
+                'code': 400,
+                'message': '没有选择文件'
+            }), 400
         
         # 检查文件类型
         if not allowed_file(file.filename):
+            print(f"不支持的文件类型: {file.filename}")
             return jsonify({
                 'code': 400,
                 'message': '不支持的文件类型，只支持.zip/.rar/.7z文件'
@@ -1015,8 +1296,11 @@ def submit():
         experiment_id = request.form.get('experimentId')
         student_id = request.form.get('studentId')
         
+        print(f"实验ID: {experiment_id}, 学生ID: {student_id}")
+        
         # 验证参数
         if not experiment_id or not student_id:
+            print("缺少必要参数")
             return jsonify({
                 'code': 400,
                 'message': '缺少必要参数：experiment_id 或 student_id'
@@ -1025,123 +1309,205 @@ def submit():
         # 验证实验和学生是否存在
         experiment = Experiment.query.get(experiment_id)
         if not experiment:
+            print(f"实验不存在: {experiment_id}")
             return jsonify({
-                'code': 400,
+                'code': 404,
                 'message': '实验不存在'
-            }), 400
-        
-        student = User.query.get(student_id)
+            }), 404
+            
+        student = User.query.filter_by(user_id=student_id, user_type=UserType.STUDENT).first()
         if not student:
+            print(f"学生不存在: {student_id}")
             return jsonify({
-                'code': 400,
+                'code': 404,
                 'message': '学生不存在'
-            }), 400
-        
-        # 验证学生是否为student类型
-        user_type = student.user_type.value if isinstance(student.user_type, UserType) else student.user_type
-        if user_type != 'student':
-            return jsonify({
-                'code': 400,
-                'message': '只有学生可以提交作业'
-            }), 400
-        
-        # 验证学生是否已提交过该实验
+            }), 404
+            
+        # 检查是否已经提交过
         existing_submission = Submission.query.filter_by(
-            experiment_id=experiment_id, 
+            experiment_id=experiment_id,
             student_id=student_id
         ).first()
         
-        # 检查是否超过截止时间
-        if experiment.deadline and datetime.utcnow() > experiment.deadline:
-            return jsonify({
-                'code': 400,
-                'message': '实验已超过截止时间，无法提交'
-            }), 400
-            
-        experiment_folder = os.path.join('lab'+str(experiment_id),'testcode')
-        file_path = os.path.join(experiment_folder, str(file.filename))
-        new_file_name = str(file.filename).split('.')[0]
-        new_file_path = os.path.join(experiment_folder, new_file_name)
+        # 获取当前工作目录和后端目录
+        current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        backend_dir = os.path.join(current_dir, "DLplatform-be")
+        print(f"当前工作目录: {current_dir}")
+        print(f"后端目录: {backend_dir}")
         
-        if not os.path.exists(experiment_folder):
-            os.makedirs(experiment_folder)
+        # 使用lab文件夹的testcode目录，放在后端目录下
+        lab_folder = f"lab{experiment_id}"
+        lab_path = os.path.join(backend_dir, lab_folder)
+        testcode_folder = os.path.join(lab_path, "testcode")
+        
+        print(f"上传文件到: {testcode_folder}")
+        
+        # 保存原始文件名（不带扩展名）
+        original_file_name = str(file.filename)
+        file_name_without_ext = os.path.splitext(original_file_name)[0]
+        
+        # 确保testcode目录存在
+        try:
+            if not os.path.exists(testcode_folder):
+                os.makedirs(testcode_folder, exist_ok=True)
+                print(f"创建目录: {testcode_folder}")
+        except Exception as e:
+            print(f"创建目录失败: {e}")
+            return jsonify({
+                'code': 500,
+                'message': f'创建目录失败: {str(e)}'
+            }), 500
             
+        # 临时保存文件的路径（直接保存到testcode目录中）
+        temp_file_path = os.path.join(testcode_folder, original_file_name)
+        
         if existing_submission:
+            print("更新现有提交")
             # 如果数据库中记录的旧文件存在，则删除旧文件，实现覆盖上传
-            existing_experiment_attachment = ExperimentAttachment.query.filter_by(
-                file_name=existing_submission.file_name,
-                file_path=existing_submission.file_path
-            ).first()
             old_file_path = existing_submission.file_path
-            if old_file_path and os.path.exists(old_file_path):
+            if old_file_path and os.path.exists(old_file_path) and old_file_path != testcode_folder:
                 if os.path.isfile(old_file_path):
                     os.remove(old_file_path)
+                    print(f"删除旧文件: {old_file_path}")
                 elif os.path.isdir(old_file_path):
                     shutil.rmtree(old_file_path)
+                    print(f"删除旧目录: {old_file_path}")
             # 保存文件
-            file.save(file_path)
-            # 获取文件大小（KB）
-            file_size = os.path.getsize(file_path) // 1024
+            try:
+                file.save(temp_file_path)
+                print(f"文件保存成功: {temp_file_path}")
+            except Exception as e:
+                print(f"保存文件失败: {e}")
+                return jsonify({
+                    'code': 500,
+                    'message': f'保存文件失败: {str(e)}'
+                }), 500
+                
+            # 解压文件到testcode目录
+            try:
+                print(f"开始解压文件: {original_file_name}")
+                if original_file_name.lower().endswith('.zip'):
+                    with zipfile.ZipFile(temp_file_path, 'r') as zip_ref:
+                        zip_ref.extractall(testcode_folder)
+                    print(f"成功解压ZIP文件到: {testcode_folder}")
+                    # 解压完成后删除原始压缩文件
+                    os.remove(temp_file_path)
+                    print(f"删除原始压缩文件: {temp_file_path}")
+                elif original_file_name.lower().endswith('.rar') or original_file_name.lower().endswith('.7z'):
+                    Archive(temp_file_path).extractall(testcode_folder)
+                    print(f"成功解压RAR/7Z文件到: {testcode_folder}")
+                    # 解压完成后删除原始压缩文件
+                    os.remove(temp_file_path)
+                    print(f"删除原始压缩文件: {temp_file_path}")
+                else:
+                    print(f"不支持的文件类型，无法解压: {original_file_name}")
+            except Exception as e:
+                print(f"解压文件失败: {e}")
+                return jsonify({
+                    'code': 500,
+                    'message': f'解压文件失败: {str(e)}'
+                }), 500
+                
+            # 计算文件夹大小（KB）
+            folder_size = 0
+            for dirpath, dirnames, filenames in os.walk(testcode_folder):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.exists(fp):
+                        folder_size += os.path.getsize(fp)
+            folder_size = folder_size // 1024
+            print(f"文件夹大小: {folder_size}KB")
+            
             # 覆盖数据库中的旧记录
-            existing_submission.file_name = new_file_name
-            existing_submission.file_path = new_file_path
-            existing_submission.submit_time = datetime.utcnow()
-            print(existing_experiment_attachment)
-            if existing_experiment_attachment:
-                existing_experiment_attachment.file_name = new_file_name
-                existing_experiment_attachment.file_path = new_file_path
-                existing_experiment_attachment.file_size = file_size
-            db.session.commit()
+            try:
+                existing_submission.file_name = file_name_without_ext  # 使用不带扩展名的原始文件名
+                existing_submission.file_path = testcode_folder  # 保存解压后的文件夹路径
+                existing_submission.submit_time = datetime.utcnow()
+                print(f"更新提交记录: {existing_submission}")
+                
+                # 更新附件记录
+                existing_experiment_attachment = ExperimentAttachment.query.filter_by(
+                    file_name=existing_submission.file_name,
+                    file_path=existing_submission.file_path
+                ).first()
+                
+                if existing_experiment_attachment:
+                    existing_experiment_attachment.file_name = file_name_without_ext  # 使用不带扩展名的原始文件名
+                    existing_experiment_attachment.file_path = testcode_folder  # 保存解压后的文件夹路径
+                    existing_experiment_attachment.file_size = folder_size
+                    print(f"更新附件记录: {existing_experiment_attachment}")
+                    
+                db.session.commit()
+                print("数据库更新成功")
+            except Exception as e:
+                db.session.rollback()
+                print(f"更新数据库失败: {e}")
+                return jsonify({
+                    'code': 500,
+                    'message': f'更新数据库失败: {str(e)}'
+                }), 500
         else:
-            file.save(file_path)
-            # 获取文件大小（KB）
-            file_size = os.path.getsize(file_path) // 1024
-            # 插入实验附件记录
-            if not insert_experiment_attachment(experiment_id, new_file_name, new_file_path, file_size):
-                # 删除已保存的文件
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+            print("创建新提交")
+            try:
+                file.save(temp_file_path)
+                print(f"文件保存成功: {temp_file_path}")
+            except Exception as e:
+                print(f"保存文件失败: {e}")
+                return jsonify({
+                    'code': 500,
+                    'message': f'保存文件失败: {str(e)}'
+                }), 500
+                
+            # 解压文件到testcode目录
+            try:
+                print(f"开始解压文件: {original_file_name}")
+                if original_file_name.lower().endswith('.zip'):
+                    with zipfile.ZipFile(temp_file_path, 'r') as zip_ref:
+                        zip_ref.extractall(testcode_folder)
+                    print(f"成功解压ZIP文件到: {testcode_folder}")
+                    # 解压完成后删除原始压缩文件
+                    os.remove(temp_file_path)
+                    print(f"删除原始压缩文件: {temp_file_path}")
+                elif original_file_name.lower().endswith('.rar') or original_file_name.lower().endswith('.7z'):
+                    Archive(temp_file_path).extractall(testcode_folder)
+                    print(f"成功解压RAR/7Z文件到: {testcode_folder}")
+                    # 解压完成后删除原始压缩文件
+                    os.remove(temp_file_path)
+                    print(f"删除原始压缩文件: {temp_file_path}")
+                else:
+                    print(f"不支持的文件类型，无法解压: {original_file_name}")
+            except Exception as e:
+                print(f"解压文件失败: {e}")
+                return jsonify({
+                    'code': 500,
+                    'message': f'解压文件失败: {str(e)}'
+                }), 500
+                
+            # 计算文件夹大小（KB）
+            folder_size = 0
+            for dirpath, dirnames, filenames in os.walk(testcode_folder):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.exists(fp):
+                        folder_size += os.path.getsize(fp)
+            folder_size = folder_size // 1024
+            print(f"文件夹大小: {folder_size}KB")
+            
+            # 插入实验附件记录和学生提交记录（使用文件夹名称和路径）
+            if not insert_experiment_attachment(experiment_id, file_name_without_ext, testcode_folder, folder_size):
                 return jsonify({
                     'code': 500,
                     'message': '保存实验附件记录失败'
                 }), 500
+            
             # 插入学生提交记录
-            if not insert_submission(experiment_id, student_id, new_file_name, new_file_path):
-                # 删除已保存的文件
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+            if not insert_submission(experiment_id, student_id, file_name_without_ext, testcode_folder):
                 return jsonify({
                     'code': 500,
                     'message': '保存学生提交记录失败'
                 }), 500
-        
-        # 解压文件
-        if str(file.filename).lower().endswith('.zip'):
-            try:
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    zip_ref.extractall(experiment_folder)
-                print(file_path)
-                os.remove(file_path)
-            except Exception as e:
-                # 解压失败，删除已保存的文件
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                return jsonify({
-                    'code': 500,
-                    'message': f'解压zip文件失败: {e}'
-                }), 500
-        elif str(file.filename).lower().endswith('.rar') or str(file.filename).lower().endswith('.7z'):
-            try:
-                Archive(file_path).extractall(experiment_folder)
-                os.remove(file_path)
-            except Exception as e:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                return jsonify({
-                    'code': 500,
-                    'message': f'解压压缩包失败: {e}'
-                }), 500        
                 
+        print("实验提交成功")
         return jsonify({
             'code': 200,
             'message': '提交成功'
@@ -1149,52 +1515,79 @@ def submit():
         
     except Exception as e:
         print(f"提交过程中发生错误: {e}")
+        traceback.print_exc()
         return jsonify({
             'code': 500,
-            'message': '服务器内部错误'
+            'message': f'服务器内部错误: {str(e)}'
         }), 500
 
 # 获取实验提交记录
 @app.route('/api/experiments/<int:experiment_id>/uploads', methods=['GET'])
-def get_experiment_uploads(experiment_id):
+def get_api_experiment_uploads(experiment_id):
     """
-    获取实验的上传历史
+    获取实验的上传历史（新API路径）
     """
     try:
         # 获取该实验的所有提交记录
         submissions = Submission.query.filter_by(experiment_id=experiment_id).all()
-        print(submissions)
+        print(f"实验 {experiment_id} 的提交记录: {submissions}")
         upload_history = []
         for submission in submissions:
-            upload_history.append({
-                'id': submission.submission_id,
-                'fileName': submission.file_name,
-                'fileSize': os.path.getsize(submission.file_path) if os.path.exists(submission.file_path) else 0,
-                'uploadTime': submission.submit_time.strftime('%Y-%m-%d %H:%M:%S'),
-                'status': 'success'
-            })
+            try:
+                file_size = 0
+                if submission.file_path and os.path.exists(submission.file_path):
+                    if os.path.isfile(submission.file_path):
+                        file_size = os.path.getsize(submission.file_path)
+                    elif os.path.isdir(submission.file_path):
+                        # 如果是目录，计算目录大小
+                        total_size = 0
+                        for dirpath, dirnames, filenames in os.walk(submission.file_path):
+                            for f in filenames:
+                                fp = os.path.join(dirpath, f)
+                                if os.path.exists(fp):
+                                    total_size += os.path.getsize(fp)
+                        file_size = total_size
+                
+                upload_history.append({
+                    'id': submission.submission_id,
+                    'fileName': submission.file_name,
+                    'fileSize': file_size,
+                    'uploadTime': submission.submit_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'status': 'success'
+                })
+            except Exception as e:
+                print(f"处理提交记录时出错: {e}")
+                continue
         
         return jsonify({
-            'success': True,
+            'code': 200,
+            'message': '获取上传历史成功',
             'data': upload_history
         })
         
     except Exception as e:
-        app.logger.error(f"获取上传历史时发生错误: {str(e)}")
+        print(f"获取上传历史时发生错误: {str(e)}")
+        traceback.print_exc()
         return jsonify({
-            'success': False,
+            'code': 500,
             'message': '获取上传历史失败'
         })
 
-@app.route('/test', methods=['GET'])
+@app.route('/test', methods=['GET', 'OPTIONS'])
 def test_models():
     """
     评测模块接口
     根据实验ID，查找所有提交的模型文件，进行评测并保存成绩
     """
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+        
     try:
         # 获取实验ID参数
         experiment_id = request.args.get('experimentId')
+        print(f"开始评测实验 ID: {experiment_id}")
         
         if not experiment_id:
             return jsonify({
@@ -1221,50 +1614,243 @@ def test_models():
                 'message': '该实验暂无提交记录'
             }), 400
         
-        # 创建临时评测目录
-        temp_eval_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'temp_eval')
-        if not os.path.exists(temp_eval_dir):
-            os.makedirs(temp_eval_dir)
-        
         evaluated_count = 0
-        print(submissions)
+        evaluation_results = []
+        print(f"开始评测，共有{len(submissions)}个提交记录")
+        
+        # 直接指定标签文件的路径
+        lab_folder = f"lab{experiment_id}"
+        print(f"实验对应的文件夹: {lab_folder}")
+        
+        # 优先查找实验对应的testdata目录下的all_labels.csv
+        possible_label_paths = [
+            os.path.join(os.getcwd(), lab_folder, "testdata", "all_labels.csv"),  # 当前目录下的实验文件夹
+            os.path.join(os.getcwd(), "..", lab_folder, "testdata", "all_labels.csv"),  # 上级目录下的实验文件夹
+            os.path.join(os.getcwd(), "testdata", "all_labels.csv"),  # 当前目录下的testdata文件夹
+        ]
+        
+        # 如果当前实验不是lab7，也尝试查找lab7中的标签文件作为备用
+        if lab_folder != "lab7":
+            possible_label_paths.append(os.path.join(os.getcwd(), "lab7", "testdata", "all_labels.csv"))
+        
+        labels_file = None
+        for path in possible_label_paths:
+            if os.path.exists(path):
+                labels_file = path
+                print(f"找到真实标签文件: {labels_file}")
+                break
+        
+        if not labels_file:
+            return jsonify({
+                'code': 400,
+                'message': f'找不到真实标签文件，请确保{lab_folder}/testdata目录中存在all_labels.csv文件'
+            }), 400
+        
+        # 读取真实标签
+        try:
+            labels_df = pd.read_csv(labels_file)
+            true_labels = labels_df.iloc[:, 0].tolist()
+            print(f"成功读取真实标签，共{len(true_labels)}个标签")
+            
+            # 如果标签文件中的标签数量与预期不符，给出警告但继续执行
+            if len(true_labels) < 1000:
+                print(f"警告：标签文件中只有{len(true_labels)}个标签，这可能不是完整的测试集")
+                
+        except Exception as e:
+            print(f"读取真实标签文件失败: {str(e)}")
+            return jsonify({
+                'code': 400,
+                'message': f'读取真实标签文件失败: {str(e)}'
+            }), 400
+        
+        # 创建一个已处理的学生ID集合，避免重复评测
+        processed_students = set()
+        
         for submission in submissions:
             try:
-                # 检查学生代码文件是否存在
-                student_code_path = os.path.join(submission.file_path, f"{submission.file_name}.py")
-                if not os.path.exists(student_code_path):
-                    print(f"学生代码文件不存在: {student_code_path}")
+                # 如果已经处理过该学生的提交，则跳过
+                if submission.student_id in processed_students:
+                    print(f"学生 {submission.student_id} 的提交已经评测过，跳过")
                     continue
                 
+                # 将学生ID添加到已处理集合
+                processed_students.add(submission.student_id)
+                
+                # 检查学生提交的文件夹是否存在
+                student_folder_path = submission.file_path
+                if not os.path.exists(student_folder_path) or not os.path.isdir(student_folder_path):
+                    print(f"学生提交文件夹不存在: {student_folder_path}")
+                    evaluation_results.append({
+                        "student_id": submission.student_id,
+                        "status": "error",
+                        "message": f"提交文件夹不存在: {student_folder_path}"
+                    })
+                    continue
+                
+                print(f"评测学生 {submission.student_id} 的提交: {student_folder_path}")
+                
+                # 检查是否是特殊情况：文件夹是lab/testcode/学号
+                testcode_path = os.path.join(os.getcwd(), lab_folder, "testcode")
+                is_testcode_submission = student_folder_path.startswith(testcode_path)
+                
+                # 在文件夹中查找Python文件
+                python_files = []
+                
+                # 如果提交路径是testcode根目录，需要找到该学生的特定文件夹
+                if is_testcode_submission and student_folder_path == testcode_path:
+                    print(f"提交路径是testcode根目录，查找学生 {submission.student_id} 的特定文件夹")
+                    
+                    # 使用file_name作为学生特定的文件夹或文件名
+                    student_specific_folder = os.path.join(student_folder_path, submission.file_name)
+                    if os.path.isdir(student_specific_folder):
+                        print(f"找到学生特定文件夹: {student_specific_folder}")
+                        student_folder_path = student_specific_folder
+                        
+                        # 在学生特定文件夹中查找Python文件
+                        for root, dirs, files in os.walk(student_specific_folder):
+                            for file in files:
+                                if file.endswith('.py'):
+                                    python_files.append(os.path.join(root, file))
+                    
+                    # 如果没有找到学生特定文件夹，尝试查找与file_name同名的Python文件
+                    if not python_files:
+                        student_specific_file = os.path.join(student_folder_path, f"{submission.file_name}.py")
+                        if os.path.exists(student_specific_file):
+                            print(f"找到学生特定文件: {student_specific_file}")
+                            python_files.append(student_specific_file)
+                else:
+                    # 正常情况下在提交文件夹中查找Python文件
+                    for root, dirs, files in os.walk(student_folder_path):
+                        for file in files:
+                            if file.endswith('.py'):
+                                python_files.append(os.path.join(root, file))
+                
+                if not python_files:
+                    print(f"学生文件夹中没有找到Python文件: {student_folder_path}")
+                    
+                    # 特殊处理：如果是testcode下的提交，尝试查找与文件夹同名的Python文件
+                    if is_testcode_submission:
+                        folder_name = submission.file_name  # 使用submission.file_name而不是os.path.basename
+                        possible_py_file = os.path.join(student_folder_path, f"{folder_name}.py")
+                        print(f"尝试查找特定文件: {possible_py_file}")
+                        
+                        if os.path.exists(possible_py_file):
+                            python_files.append(possible_py_file)
+                            print(f"找到特定文件: {possible_py_file}")
+                    
+                    if not python_files:
+                        evaluation_results.append({
+                            "student_id": submission.student_id,
+                            "status": "error",
+                            "message": "提交文件夹中没有找到Python文件"
+                        })
+                        continue
+                
+                # 优先查找main.py或者包含model的Python文件
+                main_file = None
+                
+                # 首先尝试查找与submission.file_name同名的Python文件
+                for py_file in python_files:
+                    file_name = os.path.basename(py_file).lower()
+                    if file_name.lower() == f"{submission.file_name.lower()}.py":
+                        main_file = py_file
+                        print(f"找到与提交名称匹配的文件: {main_file}")
+                        break
+                
+                # 如果没找到同名文件，再查找main.py或包含model的文件
+                if not main_file:
+                    for py_file in python_files:
+                        file_name = os.path.basename(py_file).lower()
+                        if file_name == 'main.py':
+                            main_file = py_file
+                            break
+                        elif 'model' in file_name:
+                            main_file = py_file
+                
+                # 如果还没有找到，使用第一个Python文件
+                if not main_file and python_files:
+                    main_file = python_files[0]
+                
+                if not main_file:
+                    print(f"无法确定要评测的Python文件: {student_folder_path}")
+                    evaluation_results.append({
+                        "student_id": submission.student_id,
+                        "status": "error",
+                        "message": "无法确定要评测的Python文件"
+                    })
+                    continue
+                
+                print(f"使用文件进行评测: {main_file}")
+                
+                # 获取学生代码所在目录
+                student_dir = os.path.dirname(main_file)
+                
+                # 复制真实标签文件到学生目录
+                student_labels_file = os.path.join(student_dir, "all_labels.csv")
+                if not os.path.exists(student_labels_file):
+                    try:
+                        # 在Windows上使用复制，在Linux/Mac上可以使用符号链接
+                        shutil.copy2(labels_file, student_labels_file)
+                        print(f"复制标签文件到学生目录: {student_labels_file}")
+                    except Exception as e:
+                        print(f"复制标签文件失败，但将继续尝试评测: {e}")
+                
                 # 执行学生代码进行评测
-                result = execute_student_code(student_code_path)
-                score = result["score"]
+                print(f"开始执行学生代码: {main_file}")
+                result = execute_student_code(main_file)
+                score = result.get("score", 0.0)
+                
+                # 记录评测结果
+                print(f"评测结果: {result}")
                 
                 # 保存成绩到数据库
                 if insert_grade(submission.submission_id, experiment_id, submission.student_id, score, experiment.teacher_id):
                     evaluated_count += 1
-                    print(f"学生 {submission.student_id} 的模型评测完成，得分: {score}, 消息: {result['message']}")
+                    message = result.get("message", "评测完成")
+                    print(f"学生 {submission.student_id} 的模型评测完成，得分: {score}, 消息: {message}")
+                    evaluation_results.append({
+                        "student_id": submission.student_id,
+                        "status": "success",
+                        "score": score,
+                        "message": message,
+                        "details": {k: v for k, v in result.items() if k not in ["score", "message"]}
+                    })
                 else:
                     print(f"保存学生 {submission.student_id} 的成绩失败")
+                    evaluation_results.append({
+                        "student_id": submission.student_id,
+                        "status": "failed",
+                        "message": "保存成绩失败",
+                        "details": result
+                    })
                     
             except Exception as e:
                 print(f"评测学生 {submission.student_id} 的模型时发生错误: {e}")
+                traceback.print_exc()
+                evaluation_results.append({
+                    "student_id": submission.student_id,
+                    "status": "error",
+                    "message": str(e)
+                })
                 continue
         
-        # 清理临时目录
-        if os.path.exists(temp_eval_dir):
-            shutil.rmtree(temp_eval_dir)
-        
+        # 返回结果
         return jsonify({
             'code': 200,
-            'message': f'评测完成，共评测了 {evaluated_count} 个模型'
+            'message': f'评测完成，共评测了 {evaluated_count} 个模型',
+            'data': {
+                'evaluated_count': evaluated_count,
+                'total_submissions': len(submissions),
+                'results': evaluation_results
+            }
         })
         
     except Exception as e:
         print(f"评测过程中发生错误: {e}")
+        traceback.print_exc()
         return jsonify({
             'code': 500,
-            'message': '服务器内部错误'
+            'message': f'服务器内部错误: {str(e)}'
         }), 500
 
 # 错误处理
@@ -1313,32 +1899,47 @@ def run_app():
 
 @app.route('/classes', methods=['POST'])
 def create_class():
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({
+            "code": 401,
+            "message": "未登录或登录已过期"
+        }), 401
+    
+    # 检查用户角色，只有教师才能创建班级
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'teacher':
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有教师可以创建班级"
+        }), 403
+    
     data = request.get_json()
-    class_name = data.get('class_name') if data else None
-    teacher_id = data.get('teacher_id') if data else None
+    if not data:
+        return jsonify({
+            "code": 400,
+            "message": "请求数据不能为空"
+        }), 400
+    
+    class_name = data.get('class_name')
+    
     # 参数校验
     if not class_name or not isinstance(class_name, str) or len(class_name) > 100:
         return jsonify({
             "code": 400,
             "message": "参数错误：班级名称不能为空/长度超出限制"
         }), 400
-    if teacher_id is None:
-        return jsonify({
-            "code": 400,
-            "message": "参数错误：教师ID不能为空"
-        }), 400
+    
+    # 使用当前登录教师的ID作为teacher_id
+    teacher_id = current_user.user_id
+    
     try:
-        teacher_id = int(teacher_id)
-    except (TypeError, ValueError):
-        return jsonify({
-            "code": 400,
-            "message": "参数错误：教师ID必须为整数"
-        }), 400
-    try:
-        # 使用主分支中的Class模型而不是ClassInfo
+        # 创建新班级
         new_class = Class(class_name=class_name, teacher_id=teacher_id)
         db.session.add(new_class)
         db.session.commit()
+        
         return jsonify({
             "code": 200,
             "message": "班级创建成功",
@@ -1355,6 +1956,833 @@ def create_class():
             "code": 500,
             "message": "服务器内部错误，班级创建失败，请重试"
         }), 500
+
+@app.route('/classes/<int:class_id>', methods=['PUT'])
+def update_class(class_id):
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({
+            "code": 401,
+            "message": "未登录或登录已过期"
+        }), 401
+    
+    # 检查用户角色，只有教师才能更新班级
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'teacher':
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有教师可以更新班级"
+        }), 403
+    
+    # 检查班级是否存在
+    class_obj = Class.query.get(class_id)
+    if not class_obj:
+        return jsonify({
+            "code": 404,
+            "message": f"班级不存在，class_id: {class_id}"
+        }), 404
+    
+    # 检查是否是班级的创建者
+    if class_obj.teacher_id != current_user.user_id:
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有班级创建者可以更新班级"
+        }), 403
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({
+            "code": 400,
+            "message": "请求数据不能为空"
+        }), 400
+    
+    class_name = data.get('class_name')
+    
+    # 参数校验
+    if not class_name or not isinstance(class_name, str) or len(class_name) > 100:
+        return jsonify({
+            "code": 400,
+            "message": "参数错误：班级名称不能为空/长度超出限制"
+        }), 400
+    
+    try:
+        # 更新班级名称
+        class_obj.class_name = class_name
+        db.session.commit()
+        
+        return jsonify({
+            "code": 200,
+            "message": "班级更新成功",
+            "data": {
+                "class_id": class_obj.class_id,
+                "class_name": class_obj.class_name,
+                "teacher_id": class_obj.teacher_id
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        print("数据库更新异常：", e)
+        return jsonify({
+            "code": 500,
+            "message": "服务器内部错误，班级更新失败，请重试"
+        }), 500
+
+@app.route('/classes/<int:class_id>', methods=['DELETE'])
+def delete_class(class_id):
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({
+            "code": 401,
+            "message": "未登录或登录已过期"
+        }), 401
+    
+    # 检查用户角色，只有教师才能删除班级
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'teacher':
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有教师可以删除班级"
+        }), 403
+    
+    # 检查班级是否存在
+    class_obj = Class.query.get(class_id)
+    if not class_obj:
+        return jsonify({
+            "code": 404,
+            "message": f"班级不存在，class_id: {class_id}"
+        }), 404
+    
+    # 检查是否是班级的创建者
+    if class_obj.teacher_id != current_user.user_id:
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有班级创建者可以删除班级"
+        }), 403
+    
+    try:
+        # 先解除所有学生与该班级的关联
+        students = User.query.filter_by(class_id=class_id).all()
+        for student in students:
+            student.class_id = None
+        
+        # 删除班级
+        db.session.delete(class_obj)
+        db.session.commit()
+        
+        return jsonify({
+            "code": 200,
+            "message": "班级删除成功"
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        print("数据库删除异常：", e)
+        return jsonify({
+            "code": 500,
+            "message": "服务器内部错误，班级删除失败，请重试"
+        }), 500
+
+@app.route('/classes/<int:class_id>/students', methods=['GET'])
+def get_class_students(class_id):
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({
+            "code": 401,
+            "message": "未登录或登录已过期"
+        }), 401
+    
+    # 检查班级是否存在
+    class_obj = Class.query.get(class_id)
+    if not class_obj:
+        return jsonify({
+            "code": 404,
+            "message": f"班级不存在，class_id: {class_id}"
+        }), 404
+    
+    try:
+        # 获取班级的所有学生
+        students = User.query.filter_by(class_id=class_id, user_type='student').all()
+        student_list = []
+        for student in students:
+            student_list.append({
+                "id": student.user_id,
+                "username": student.username,
+                "name": student.real_name,
+                "studentId": student.student_id,
+                "email": student.email
+            })
+        
+        return jsonify({
+            "code": 200,
+            "message": "获取成功",
+            "data": student_list
+        }), 200
+    except Exception as e:
+        print("获取班级学生列表异常：", e)
+        return jsonify({
+            "code": 500,
+            "message": "服务器内部错误，获取班级学生列表失败，请重试"
+        }), 500
+
+@app.route('/classes/<int:class_id>/students', methods=['POST'])
+def add_student_to_class(class_id):
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({
+            "code": 401,
+            "message": "未登录或登录已过期"
+        }), 401
+    
+    # 检查用户角色，只有教师才能添加学生到班级
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'teacher':
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有教师可以添加学生到班级"
+        }), 403
+    
+    # 检查班级是否存在
+    class_obj = Class.query.get(class_id)
+    if not class_obj:
+        return jsonify({
+            "code": 404,
+            "message": f"班级不存在，class_id: {class_id}"
+        }), 404
+    
+    # 检查是否是班级的创建者
+    if class_obj.teacher_id != current_user.user_id:
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有班级创建者可以添加学生到班级"
+        }), 403
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({
+            "code": 400,
+            "message": "请求数据不能为空"
+        }), 400
+    
+    username = data.get('username')
+    if not username:
+        return jsonify({
+            "code": 400,
+            "message": "参数错误：学生用户名不能为空"
+        }), 400
+    
+    try:
+        # 查找学生
+        student = User.query.filter_by(username=username, user_type='student').first()
+        if not student:
+            return jsonify({
+                "code": 404,
+                "message": f"学生不存在，username: {username}"
+            }), 404
+        
+        # 将学生添加到班级
+        student.class_id = class_id
+        db.session.commit()
+        
+        return jsonify({
+            "code": 200,
+            "message": "学生添加成功",
+            "data": {
+                "student_id": student.user_id,
+                "username": student.username,
+                "name": student.real_name,
+                "class_id": class_id
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        print("添加学生到班级异常：", e)
+        return jsonify({
+            "code": 500,
+            "message": "服务器内部错误，添加学生到班级失败，请重试"
+        }), 500
+
+@app.route('/classes/<int:class_id>/students/<int:student_id>', methods=['DELETE'])
+def remove_student_from_class(class_id, student_id):
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({
+            "code": 401,
+            "message": "未登录或登录已过期"
+        }), 401
+    
+    # 检查用户角色，只有教师才能从班级移除学生
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'teacher':
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有教师可以从班级移除学生"
+        }), 403
+    
+    # 检查班级是否存在
+    class_obj = Class.query.get(class_id)
+    if not class_obj:
+        return jsonify({
+            "code": 404,
+            "message": f"班级不存在，class_id: {class_id}"
+        }), 404
+    
+    # 检查是否是班级的创建者
+    if class_obj.teacher_id != current_user.user_id:
+        return jsonify({
+            "code": 403,
+            "message": "权限不足，只有班级创建者可以从班级移除学生"
+        }), 403
+    
+    try:
+        # 查找学生
+        student = User.query.get(student_id)
+        if not student or student.user_type != 'student':
+            return jsonify({
+                "code": 404,
+                "message": f"学生不存在，student_id: {student_id}"
+            }), 404
+        
+        # 检查学生是否在该班级
+        if student.class_id != class_id:
+            return jsonify({
+                "code": 400,
+                "message": f"学生不在该班级，student_id: {student_id}, class_id: {class_id}"
+            }), 400
+        
+        # 将学生从班级移除
+        student.class_id = None
+        db.session.commit()
+        
+        return jsonify({
+            "code": 200,
+            "message": "学生移除成功"
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        print("从班级移除学生异常：", e)
+        return jsonify({
+            "code": 500,
+            "message": "服务器内部错误，从班级移除学生失败，请重试"
+        }), 500
+
+@app.route('/classes', methods=['GET'])
+def get_classes():
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({
+            "code": 401,
+            "message": "未登录或登录已过期"
+        }), 401
+    
+    # 获取查询参数
+    teacher_id = request.args.get('teacher_id')
+    
+    try:
+        # 构建查询
+        query = Class.query
+        
+        # 如果指定了教师ID，则只返回该教师创建的班级
+        if teacher_id:
+            try:
+                teacher_id = int(teacher_id)
+                query = query.filter_by(teacher_id=teacher_id)
+            except (TypeError, ValueError):
+                return jsonify({
+                    "code": 400,
+                    "message": "参数错误：teacher_id必须为整数"
+                }), 400
+        
+        # 如果是教师用户，默认只返回自己创建的班级
+        user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+        if user_type == 'teacher' and not teacher_id:
+            query = query.filter_by(teacher_id=current_user.user_id)
+        
+        # 执行查询
+        classes = query.all()
+        
+        # 构建返回数据
+        class_list = []
+        for class_obj in classes:
+            class_list.append({
+                "class_id": class_obj.class_id,
+                "class_name": class_obj.class_name,
+                "teacher_id": class_obj.teacher_id
+            })
+        
+        return jsonify({
+            "code": 200,
+            "message": "获取成功",
+            "data": class_list
+        }), 200
+    except Exception as e:
+        print("获取班级列表异常：", e)
+        return jsonify({
+            "code": 500,
+            "message": "服务器内部错误，获取班级列表失败，请重试"
+        }), 500
+
+# 获取实验列表接口
+@app.route('/experiments/list', methods=['GET', 'OPTIONS'])
+def get_experiments_list():
+    """
+    获取当前学生可访问的实验列表
+    """
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+        
+    try:
+        # 获取当前用户
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({
+                'code': 401,
+                'message': '未登录或登录已过期'
+            }), 401
+        
+        # 获取用户类型
+        user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+        
+        # 根据用户类型获取不同的实验列表
+        if user_type == 'student':
+            # 学生只能看到自己班级的实验
+            class_id = current_user.class_id
+            if not class_id:
+                return jsonify({
+                    'code': 200,
+                    'message': '获取成功',
+                    'data': []  # 如果学生没有班级，返回空列表
+                })
+            
+            # 查询该班级的所有实验
+            experiments = Experiment.query.filter_by(class_id=class_id).order_by(Experiment.publish_time.desc()).all()
+            
+            # 查询学生的提交记录
+            submissions = Submission.query.filter_by(student_id=current_user.user_id).all()
+            submitted_experiment_ids = {submission.experiment_id for submission in submissions}
+            
+            # 构建返回数据
+            experiment_list = []
+            for exp in experiments:
+                exp_data = exp.to_dict()
+                exp_data['submitted'] = exp.experiment_id in submitted_experiment_ids
+                experiment_list.append(exp_data)
+            
+            return jsonify({
+                'code': 200,
+                'message': '获取成功',
+                'data': experiment_list
+            })
+        
+        elif user_type == 'teacher':
+            # 教师可以看到自己创建的实验
+            experiments = Experiment.query.filter_by(teacher_id=current_user.user_id).order_by(Experiment.publish_time.desc()).all()
+            experiment_list = [exp.to_dict() for exp in experiments]
+            
+            return jsonify({
+                'code': 200,
+                'message': '获取成功',
+                'data': experiment_list
+            })
+        
+        else:
+            return jsonify({
+                'code': 403,
+                'message': '无效的用户类型'
+            }), 403
+    
+    except Exception as e:
+        print("获取实验列表异常：", e)
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': '服务器内部错误，获取实验列表失败'
+        }), 500
+
+# 下载附件
+@app.route('/download/attachment/<int:attachment_id>', methods=['GET', 'OPTIONS'])
+def download_attachment(attachment_id):
+    """
+    下载实验附件
+    """
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+    
+    try:
+        # 查询附件信息
+        attachment = ExperimentAttachment.query.get(attachment_id)
+        if not attachment:
+            return jsonify({
+                'code': 404,
+                'message': f'附件不存在，attachment_id: {attachment_id}'
+            }), 404
+        
+        print(f"尝试下载文件: {attachment.file_path}")
+        
+        # 检查文件是否存在
+        if not os.path.exists(attachment.file_path):
+            print(f"文件不存在: {attachment.file_path}")
+            print(f"当前工作目录: {os.getcwd()}")
+            
+            # 尝试在lab文件夹中查找
+            experiment_id = attachment.experiment_id
+            file_name = attachment.file_name
+            
+            # 获取当前工作目录和后端目录
+            current_dir = os.getcwd()
+            backend_dir = os.path.join(current_dir, "DLplatform-be")
+            print(f"后端目录: {backend_dir}")
+            
+            # 尝试不同的文件路径
+            possible_paths = [
+                os.path.join(backend_dir, f"lab{experiment_id}", "upload", file_name),  # 后端目录下的lab文件夹
+                os.path.join(current_dir, f"lab{experiment_id}", "upload", file_name),  # 当前目录下的lab文件夹
+                os.path.join(f"lab{experiment_id}", "upload", file_name),  # 相对路径
+            ]
+            
+            file_found = False
+            for path in possible_paths:
+                print(f"尝试替代路径: {path}")
+                if os.path.exists(path):
+                    print(f"找到文件在替代路径: {path}")
+                    attachment.file_path = path
+                    db.session.commit()
+                    file_found = True
+                    break
+            
+            if not file_found:
+                return jsonify({
+                    'code': 404,
+                    'message': f'文件不存在，file_path: {attachment.file_path}'
+                }), 404
+        
+        # 获取文件名，使用原始文件名
+        filename = os.path.basename(attachment.file_path)
+        
+        # 返回文件
+        response = send_file(
+            attachment.file_path,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/octet-stream'
+        )
+        
+        # 添加CORS头
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+    
+    except Exception as e:
+        print(f"下载附件错误: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': f'服务器内部错误，下载附件失败: {str(e)}'
+        }), 500
+
+@app.route('/teacher/experiments', methods=['GET'])
+def get_teacher_experiments():
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({'error': '未授权访问'}), 401
+    
+    # 确保是教师用户
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'teacher':
+        return jsonify({'error': '只有教师可以访问此资源'}), 403
+    
+    # 获取查询参数
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', 10, type=int)
+    recent = request.args.get('recent', 'false').lower() == 'true'
+    
+    # 查询该教师创建的所有实验
+    query = Experiment.query.filter_by(teacher_id=current_user.user_id)
+    
+    # 如果请求最近的实验，按发布时间降序排序
+    if recent:
+        query = query.order_by(Experiment.publish_time.desc())
+    
+    # 分页
+    total = query.count()
+    experiments = query.offset((page - 1) * limit).limit(limit).all()
+    
+    # 获取待评价的提交数量
+    pending_evaluations = db.session.query(Submission).join(
+        Experiment, Submission.experiment_id == Experiment.experiment_id
+    ).filter(
+        Experiment.teacher_id == current_user.user_id,
+        ~db.exists().where(Grade.submission_id == Submission.submission_id)
+    ).count()
+    
+    # 构建响应
+    result = {
+        'data': [exp.to_dict() for exp in experiments],
+        'total': total,
+        'page': page,
+        'limit': limit,
+        'pendingEvaluations': pending_evaluations
+    }
+    
+    return jsonify(result)
+
+@app.route('/evaluations', methods=['GET'])
+def get_evaluations():
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({'error': '未授权访问'}), 401
+    
+    # 确保是教师用户
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'teacher':
+        return jsonify({'error': '只有教师可以访问此资源'}), 403
+    
+    experiment_id = request.args.get('experiment_id')
+    class_id = request.args.get('class_id')
+    status = request.args.get('status')
+    page = int(request.args.get('page', 1))
+    limit = int(request.args.get('limit', 10))
+    
+    # 构建基础查询 - 使用四表联合查询
+    query = db.session.query(
+        Submission,
+        User,
+        Class,
+        Grade,
+        Experiment
+    ).join(
+        User, Submission.student_id == User.user_id
+    ).join(
+        Class, User.class_id == Class.class_id
+    ).outerjoin(
+        Grade, Submission.submission_id == Grade.submission_id
+    ).join(
+        Experiment, Submission.experiment_id == Experiment.experiment_id
+    )
+    
+    # 只显示当前教师创建的实验的提交
+    query = query.filter(Experiment.teacher_id == current_user.user_id)
+    
+    # 应用过滤条件
+    if experiment_id:
+        try:
+            experiment_id = int(experiment_id)
+            query = query.filter(Submission.experiment_id == experiment_id)
+            
+            # 验证实验是否存在且属于当前教师
+            experiment = Experiment.query.get(experiment_id)
+            if not experiment:
+                return jsonify({'error': '实验不存在'}), 404
+            
+            if experiment.teacher_id != current_user.user_id:
+                return jsonify({'error': '您没有权限查看此实验的评价'}), 403
+        except ValueError:
+            return jsonify({'error': '实验ID必须是整数'}), 400
+    
+    if class_id and class_id != '':
+        try:
+            class_id = int(class_id)
+            query = query.filter(Class.class_id == class_id)
+        except ValueError:
+            return jsonify({'error': '班级ID必须是整数'}), 400
+            
+    if status and status != '':
+        try:
+            status = int(status)
+            if status == 1:  # 已提交未评测
+                query = query.filter(Grade.score == None)
+            elif status == 2 or status == 3:  # 已评价/已评测
+                query = query.filter(Grade.score != None)
+        except ValueError:
+            return jsonify({'error': '状态值必须是整数'}), 400
+
+    # 获取总数
+    total = query.count()
+    
+    # 分页
+    results = query.order_by(Submission.submit_time.desc()).offset((page - 1) * limit).limit(limit).all()
+    
+    # 打印调试信息
+    print(f"找到 {total} 条提交记录")
+    
+    # 构建返回数据
+    data = []
+    for submission, user, class_, grade, experiment in results:
+        data.append({
+            'id': submission.submission_id,
+            'experiment_title': experiment.experiment_name,
+            'student_name': user.real_name or user.username,
+            'class_name': class_.class_name,
+            'submit_time': submission.submit_time.strftime('%Y-%m-%d %H:%M:%S') if submission.submit_time else '',
+            'status': 3 if grade and grade.score is not None else 1,  # 3:已评测, 1:待评测
+            'score': float(grade.score) if grade and grade.score is not None else None,
+            'file_path': submission.file_path,
+            'file_name': submission.file_name,
+            'experiment_id': experiment.experiment_id
+        })
+    
+    print(f"返回数据: {data}")
+    
+    return jsonify({
+        'data': {
+            'list': data,
+            'total': total
+        }
+    })
+
+@app.route('/results', methods=['GET'])
+def get_results():
+    experiment_id = request.args.get('experiment_id')
+    class_id = request.args.get('class_id')
+    page = int(request.args.get('page', 1))
+    limit = int(request.args.get('limit', 10))
+
+    query = db.session.query(
+        Grade,
+        User,
+        Class,
+        Experiment
+    ).join(
+        User, Grade.student_id == User.user_id
+    ).join(
+        Class, User.class_id == Class.class_id
+    ).join(
+        Experiment, Grade.experiment_id == Experiment.experiment_id
+    )
+
+    if experiment_id:
+        query = query.filter(Grade.experiment_id == experiment_id)
+    if class_id:
+        query = query.filter(Class.class_id == class_id)
+
+    total = query.count()
+    results = query.order_by(Grade.graded_at.desc()).offset((page - 1) * limit).limit(limit).all()
+
+    data = []
+    for grade, user, class_, experiment in results:
+        data.append({
+            'id': grade.grade_id,
+            'experiment_title': experiment.experiment_name,
+            'student_name': user.real_name or user.username,
+            'class_name': class_.class_name,
+            'score': float(grade.score),
+            'graded_at': grade.graded_at.strftime('%Y-%m-%d %H:%M:%S') if grade.graded_at else '',
+            'submission_id': grade.submission_id
+        })
+
+    return jsonify({
+        'data': {
+            'list': data,
+            'total': total
+        }
+    })
+
+@app.route('/api/teacher/experiments', methods=['GET'])
+def api_teacher_experiments():
+    experiments = Experiment.query.all()
+    data = []
+    for e in experiments:
+        data.append({
+            'id': e.experiment_id,
+            'title': e.experiment_name,
+            'class_id': e.class_id,
+            'deadline': e.deadline.strftime('%Y-%m-%d %H:%M:%S') if e.deadline else '',
+        })
+    return jsonify({'data': data})
+
+@app.route('/api/classes', methods=['GET'])
+def api_classes():
+    classes = Class.query.all()
+    data = []
+    for c in classes:
+        data.append({
+            'id': c.class_id,
+            'name': c.class_name,
+            'teacher_id': c.teacher_id
+        })
+    return jsonify({'data': data})
+
+@app.route('/api/student/experiments', methods=['GET', 'OPTIONS'])
+def api_student_experiments():
+    # 分页参数
+    page = int(request.args.get('page', 1))
+    limit = int(request.args.get('limit', 10))
+    keyword = request.args.get('keyword', '').strip()
+    
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({'error': '未授权访问'}), 401
+    
+    # 确保是学生用户
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'student':
+        return jsonify({'error': '只有学生可以访问此资源'}), 403
+    
+    student_id = current_user.user_id
+
+    query = Experiment.query
+
+    if keyword:
+        query = query.filter(Experiment.experiment_name.like(f'%{keyword}%'))
+
+    total = query.count()
+    experiments = query.order_by(Experiment.publish_time.desc()).offset((page - 1) * limit).limit(limit).all()
+
+    # 获取所有教师ID
+    teacher_ids = [e.teacher_id for e in experiments]
+    teachers = User.query.filter(User.user_id.in_(teacher_ids)).all()
+    teacher_map = {t.user_id: t.real_name or t.username for t in teachers}
+
+    # 获取当前学生所有提交
+    exp_ids = [e.experiment_id for e in experiments]
+    submissions = Submission.query.filter(
+        Submission.experiment_id.in_(exp_ids),
+        Submission.student_id == student_id
+    ).all()
+    submitted_map = {s.experiment_id: True for s in submissions}
+
+    data = []
+    for e in experiments:
+        data.append({
+            'id': e.experiment_id,
+            'title': e.experiment_name,
+            'teacherName': teacher_map.get(e.teacher_id, ''),
+            'startTime': e.publish_time.strftime('%Y-%m-%d %H:%M:%S') if e.publish_time else '',
+            'endTime': e.deadline.strftime('%Y-%m-%d %H:%M:%S') if e.deadline else '',
+            'submitted': submitted_map.get(e.experiment_id, False)
+        })
+
+    return jsonify({
+        'data': data,
+        'total': total
+    })
+
+@app.route('/api/experiments/<int:experiment_id>', methods=['GET', 'OPTIONS'])
+def get_api_experiment_detail(experiment_id):
+    experiment = Experiment.query.get(experiment_id)
+    if not experiment:
+        return jsonify({'error': '实验不存在'}), 404
+    # 获取教师姓名
+    teacher = User.query.get(experiment.teacher_id)
+    teacher_name = teacher.real_name or teacher.username if teacher else ''
+    return jsonify({
+        'id': experiment.experiment_id,
+        'title': experiment.experiment_name,
+        'teacherName': teacher_name,
+        'deadline': experiment.deadline.strftime('%Y-%m-%d %H:%M:%S') if experiment.deadline else '',
+        'description': experiment.description,
+        'publishTime': experiment.publish_time.strftime('%Y-%m-%d %H:%M:%S') if experiment.publish_time else ''
+    })
 
 if __name__ == '__main__':
     run_app()
