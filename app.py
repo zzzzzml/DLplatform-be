@@ -3661,22 +3661,74 @@ def check_plagiarism():
         for submission in submissions:
             student_id = submission.student_id
             student_folder_path = submission.file_path
+            student_file_name = submission.file_name
             
             if not os.path.exists(student_folder_path) or not os.path.isdir(student_folder_path):
                 print(f"学生{student_id}提交文件夹不存在: {student_folder_path}")
                 continue
             
-            # 在提交文件夹中查找pth文件
+            # 在提交文件夹中查找pth文件，优先查找学生自己的文件夹
             pth_files = []
-            for root, dirs, files in os.walk(student_folder_path):
-                for file in files:
-                    if file.endswith('.pth'):
-                        pth_files.append(os.path.join(root, file))
+            
+            # 首先检查是否存在以学生学号或文件名命名的子文件夹
+            possible_student_folders = []
+            
+            # 1. 检查学生提交的文件名对应的文件夹
+            if student_file_name:
+                possible_student_folders.append(os.path.join(student_folder_path, student_file_name))
+            
+            # 2. 检查以学生ID命名的文件夹
+            student_info = User.query.get(student_id)
+            if student_info and student_info.student_id:
+                possible_student_folders.append(os.path.join(student_folder_path, student_info.student_id))
+            
+            # 3. 检查以学生ID命名的文件夹
+            possible_student_folders.append(os.path.join(student_folder_path, str(student_id)))
+            
+            # 首先在可能的学生专属文件夹中查找
+            student_specific_folder_found = False
+            for folder in possible_student_folders:
+                if os.path.exists(folder) and os.path.isdir(folder):
+                    print(f"找到学生{student_id}的专属文件夹: {folder}")
+                    for root, dirs, files in os.walk(folder):
+                        for file in files:
+                            if file.endswith('.pth'):
+                                pth_files.append(os.path.join(root, file))
+                    
+                    if pth_files:
+                        student_specific_folder_found = True
+                        break
+            
+            # 如果没有在学生专属文件夹中找到pth文件，则在整个提交文件夹中查找
+            if not student_specific_folder_found:
+                for root, dirs, files in os.walk(student_folder_path):
+                    # 跳过其他学生的专属文件夹
+                    skip_folder = False
+                    for other_submission in submissions:
+                        if other_submission.student_id != student_id:
+                            other_student_file_name = other_submission.file_name
+                            if other_student_file_name and root.endswith(other_student_file_name):
+                                skip_folder = True
+                                break
+                    
+                    if skip_folder:
+                        continue
+                        
+                    for file in files:
+                        if file.endswith('.pth'):
+                            # 检查文件名是否包含学生ID或提交名称，优先选择这样的文件
+                            if (student_file_name and student_file_name in file) or \
+                               (student_info and student_info.student_id and student_info.student_id in file) or \
+                               (str(student_id) in file):
+                                pth_files.insert(0, os.path.join(root, file))  # 放在列表前面优先选择
+                            else:
+                                pth_files.append(os.path.join(root, file))
             
             if pth_files:
                 # 如果找到多个pth文件，使用第一个
                 student_pth_files[student_id] = pth_files[0]
-                print(f"找到学生{student_id}的pth文件: {pth_files[0]}")
+                file_size = os.path.getsize(pth_files[0])
+                print(f"找到学生{student_id}的pth文件: {pth_files[0]}, 大小: {file_size} 字节")
             else:
                 print(f"学生{student_id}的提交中没有找到pth文件")
         
@@ -3687,104 +3739,53 @@ def check_plagiarism():
                 'message': '未找到任何pth文件进行查重'
             }), 400
         
-        # 计算文件相似度的函数
+        # 计算文件相似度的函数 - 仅比较文件大小
         def calculate_similarity(file1, file2):
             try:
-                # 读取文件二进制内容
-                with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
-                    content1 = f1.read()
-                    content2 = f2.read()
+                # 检查是否是同一个文件路径
+                if os.path.normpath(file1) == os.path.normpath(file2):
+                    print(f"警告：正在比较相同的文件路径: {file1}")
+                    return 0.0  # 返回0%相似度，因为不应该比较相同文件
                 
-                # 如果文件大小相差太多，相似度应该较低
-                size1 = len(content1)
-                size2 = len(content2)
+                # 获取文件大小
+                size1 = os.path.getsize(file1)
+                size2 = os.path.getsize(file2)
                 
-                # 如果文件大小相差超过20%，降低基础相似度
-                if abs(size1 - size2) > 0.2 * max(size1, size2):
-                    base_similarity = 30  # 基础相似度降低
-                else:
-                    base_similarity = 50  # 文件大小相近，基础相似度较高
+                # 打印调试信息
+                print(f"比较文件: {os.path.basename(file1)} ({size1} 字节) 与 {os.path.basename(file2)} ({size2} 字节)")
                 
-                # 比较文件头部和尾部（通常包含元数据和模型架构信息）
-                # 头部比较 - 取前2KB
-                head_size = min(2048, min(size1, size2))
-                head1 = content1[:head_size]
-                head2 = content2[:head_size]
+                # 如果文件大小完全相同，则认为是高度相似
+                if size1 == size2:
+                    # 对于大小相同的文件，相似度为100%
+                    print(f"文件大小完全相同: {size1} 字节，相似度: 100.00%")
+                    return 100.0
                 
-                # 计算头部相似度 - 使用分块比较方法
-                head_similarity = 0
-                block_size = 64  # 64字节一个块
-                for i in range(0, head_size, block_size):
-                    block1 = head1[i:i+block_size]
-                    block2 = head2[i:i+block_size]
-                    # 计算块内相同字节的比例
-                    if block1 == block2:
-                        head_similarity += 1
+                # 计算大小差异百分比
+                size_diff_percent = abs(size1 - size2) / max(size1, size2) * 100
                 
-                head_similarity = (head_similarity * block_size / head_size) * 100 if head_size > 0 else 0
+                # 相似度 = 100 - 差异百分比，但最低为0
+                similarity = max(0, 100 - size_diff_percent)
                 
-                # 尾部比较 - 取后1KB
-                tail_size = min(1024, min(size1, size2))
-                tail1 = content1[-tail_size:] if size1 >= tail_size else content1
-                tail2 = content2[-tail_size:] if size2 >= tail_size else content2
+                # 确保相似度在0-99.9范围内（除非完全相同）
+                if similarity < 100:
+                    similarity = min(99.9, similarity)
                 
-                # 计算尾部相似度
-                tail_similarity = 0
-                for i in range(0, tail_size, block_size):
-                    block1 = tail1[i:i+block_size]
-                    block2 = tail2[i:i+block_size]
-                    if block1 == block2:
-                        tail_similarity += 1
-                
-                tail_similarity = (tail_similarity * block_size / tail_size) * 100 if tail_size > 0 else 0
-                
-                # 抽样比较文件中间部分
-                # 选择多个位置进行抽样比较
-                samples = 10
-                middle_similarity = 0
-                
-                for _ in range(samples):
-                    # 随机选择一个位置，但避开头尾
-                    min_pos = head_size
-                    max_pos = min(size1, size2) - tail_size - block_size
-                    
-                    if max_pos <= min_pos:
-                        # 文件太小，无法进行中间部分抽样
-                        continue
-                    
-                    pos = random.randint(min_pos, max_pos)
-                    sample1 = content1[pos:pos+block_size]
-                    sample2 = content2[pos:pos+block_size]
-                    
-                    if sample1 == sample2:
-                        middle_similarity += 1
-                
-                middle_similarity = (middle_similarity / samples) * 100
-                
-                # 计算总相似度 - 头部权重高，因为包含模型架构信息
-                # 尾部权重次之，中间部分权重最低
-                weighted_similarity = (head_similarity * 0.5) + (tail_similarity * 0.3) + (middle_similarity * 0.2)
-                
-                # 应用基础相似度调整
-                final_similarity = base_similarity + (weighted_similarity * 0.5)
-                
-                # 确保相似度在0-100范围内
-                final_similarity = max(0, min(100, final_similarity))
-                
-                print(f"文件相似度计算 - 大小相似度: {base_similarity}, 头部: {head_similarity:.2f}%, 尾部: {tail_similarity:.2f}%, 中间: {middle_similarity:.2f}%, 最终: {final_similarity:.2f}%")
-                
-                return final_similarity
+                print(f"文件大小差异: {size_diff_percent:.2f}%, 相似度: {similarity:.2f}%")
+                return similarity
             except Exception as e:
                 print(f"计算文件相似度时出错: {str(e)}")
+                traceback.print_exc()  # 打印详细错误堆栈
                 return 0
         
         # 获取风险级别
         def get_risk_level(similarity):
-            if similarity >= 80:
+            if similarity == 100:
+                return "完全重复"
+            elif similarity >= 99:
                 return "极高风险"
-            elif similarity >= 70:
+            elif similarity >= 95:
                 return "高风险"
-            elif similarity >= 60:
+            elif similarity >= 90:
                 return "中等风险"
             else:
                 return "低风险"
@@ -3794,6 +3795,22 @@ def check_plagiarism():
         
         # 对每个学生的pth文件进行两两比较
         student_ids = list(student_pth_files.keys())
+        
+        # 如果只有一个学生提交，无法进行比较
+        if len(student_ids) <= 1:
+            print(f"只有{len(student_ids)}个学生提交了pth文件，无法进行查重")
+            return jsonify({
+                'code': 200,
+                'message': f'只有{len(student_ids)}个学生提交了pth文件，无法进行查重',
+                'data': {
+                    'checked_count': 0,
+                    'total_submissions': len(submissions),
+                    'results': []
+                }
+            })
+        
+        print(f"开始对{len(student_ids)}个学生的pth文件进行两两比较")
+        
         for i, student_id1 in enumerate(student_ids):
             # 获取学生信息
             student1 = User.query.get(student_id1)
@@ -3807,6 +3824,8 @@ def check_plagiarism():
             # 存储所有相似度结果，用于调试
             all_similarities = []
             
+            print(f"\n检查学生 {student_name1} (ID: {student_id1}) 的文件: {student_pth_files[student_id1]}")
+            
             for j, student_id2 in enumerate(student_ids):
                 if i == j:  # 跳过自己
                     continue
@@ -3814,6 +3833,8 @@ def check_plagiarism():
                 # 获取学生2的信息
                 student2 = User.query.get(student_id2)
                 student_name2 = student2.real_name or student2.username if student2 else f"学生ID: {student_id2}"
+                
+                print(f"  比较与学生 {student_name2} (ID: {student_id2}) 的文件...")
                 
                 # 计算两个文件的相似度
                 similarity = calculate_similarity(student_pth_files[student_id1], student_pth_files[student_id2])
