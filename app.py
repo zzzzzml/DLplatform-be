@@ -11,6 +11,8 @@ import shutil
 import zipfile
 import re
 import traceback
+import time
+import threading
 try:
     from pyunpack import Archive
 except ImportError:
@@ -27,6 +29,97 @@ import random
 
 # 创建Flask应用
 app = Flask(__name__)
+
+# 添加文件路径查找工具函数
+def find_file_path(file_name, experiment_id=None, sub_dir=None, search_dirs=None):
+    """
+    动态查找文件路径
+    
+    参数:
+        file_name: 要查找的文件名
+        experiment_id: 实验ID，如果提供则会在lab{experiment_id}目录下查找
+        sub_dir: 子目录名称，如testcode、testdata、upload等
+        search_dirs: 自定义搜索目录列表，如果为None则使用默认目录
+        
+    返回:
+        找到的文件路径，如果未找到则返回None
+    """
+    # 获取当前文件所在目录的绝对路径（DLplatform-be目录）
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    # 项目根目录（DLplatform目录）
+    project_dir = os.path.dirname(app_dir)
+    # 当前工作目录
+    current_dir = os.getcwd()
+    
+    # 默认搜索目录
+    if search_dirs is None:
+        search_dirs = [
+            app_dir,  # 后端目录
+            project_dir,  # 项目根目录
+            current_dir,  # 当前工作目录
+        ]
+    
+    # 构建可能的路径
+    possible_paths = []
+    
+    # 如果提供了实验ID，则在lab{experiment_id}目录下查找
+    if experiment_id is not None:
+        lab_folder = f"lab{experiment_id}"
+        
+        # 如果提供了子目录，则在子目录下查找
+        if sub_dir is not None:
+            for dir_path in search_dirs:
+                possible_paths.append(os.path.join(dir_path, lab_folder, sub_dir, file_name))
+        else:
+            for dir_path in search_dirs:
+                possible_paths.append(os.path.join(dir_path, lab_folder, file_name))
+    else:
+        # 如果没有提供实验ID，则直接在搜索目录下查找
+        for dir_path in search_dirs:
+            if sub_dir is not None:
+                possible_paths.append(os.path.join(dir_path, sub_dir, file_name))
+            else:
+                possible_paths.append(os.path.join(dir_path, file_name))
+    
+    # 查找文件
+    for path in possible_paths:
+        if os.path.exists(path):
+            print(f"找到文件: {path}")
+            return path
+    
+    # 如果未找到文件，返回None
+    print(f"未找到文件: {file_name}")
+    return None
+
+# 确保实验目录存在
+def ensure_experiment_dir(experiment_id, sub_dir=None):
+    """
+    确保实验目录存在
+    
+    参数:
+        experiment_id: 实验ID
+        sub_dir: 子目录名称，如testcode、testdata、upload等
+        
+    返回:
+        实验目录的绝对路径
+    """
+    # 获取当前文件所在目录的绝对路径（DLplatform-be目录）
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 构建实验目录路径
+    lab_folder = f"lab{experiment_id}"
+    lab_path = os.path.join(app_dir, lab_folder)
+    
+    # 如果提供了子目录，则在子目录下创建
+    if sub_dir is not None:
+        dir_path = os.path.join(lab_path, sub_dir)
+    else:
+        dir_path = lab_path
+    
+    # 确保目录存在
+    os.makedirs(dir_path, exist_ok=True)
+    
+    return dir_path
 
 # 配置CORS
 CORS(app, resources={
@@ -59,6 +152,7 @@ def after_request(response):
 
 # 配置数据库
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:root@localhost/dlplatform'
+# app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:dl_platform123@mysql-db/dl_platform'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -296,9 +390,6 @@ def execute_student_code(student_code_path):
     执行学生提交的Python文件，生成测试CSV，与真实标签比对计算准确度
     """
     try:
-        # 获取Flask应用的根目录（DLplatform-be的上级目录）
-        app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        
         # 构建绝对路径
         absolute_student_code_path = os.path.abspath(student_code_path)
         print(f"评测文件绝对路径: {absolute_student_code_path}")
@@ -330,6 +421,67 @@ def execute_student_code(student_code_path):
                 spec = importlib.util.spec_from_file_location(module_name, absolute_student_code_path)
                 if not spec:
                     return {"score": 0.0, "message": f"无法加载模块规范: {module_name}"}
+                
+                # 检查是否需要MNIST数据集文件
+                # 提取实验ID以确定是否需要处理MNIST数据集
+                path_parts = absolute_student_code_path.split(os.sep)
+                experiment_id = None
+                for i, part in enumerate(path_parts):
+                    if part.startswith('lab'):
+                        try:
+                            experiment_id = int(part[3:])
+                            print(f"从路径提取到实验ID: {experiment_id}")
+                        except ValueError:
+                            pass
+                        break
+                
+                # 如果是需要MNIST数据集的实验，检查并准备数据文件
+                mnist_files = ['t10k-images-idx3-ubyte', 't10k-labels-idx1-ubyte']
+                if experiment_id in [7, 8, 9]:  # 假设这些实验需要MNIST数据集
+                    print(f"检测到实验{experiment_id}可能需要MNIST数据集")
+                    
+                    # 检查学生代码中是否有对MNIST数据文件的引用
+                    with open(absolute_student_code_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        code_content = f.read()
+                        if any(mnist_file in code_content for mnist_file in mnist_files):
+                            print("检测到代码中可能使用MNIST数据文件")
+                            
+                            # 查找MNIST数据文件并复制到学生目录
+                            for mnist_file in mnist_files:
+                                # 尝试查找MNIST数据文件
+                                mnist_file_path = find_file_path(mnist_file, experiment_id=experiment_id, sub_dir='testdata')
+                                if not mnist_file_path:
+                                    # 如果当前实验目录没有，尝试在lab7中查找
+                                    mnist_file_path = find_file_path(mnist_file, experiment_id=7, sub_dir='testdata')
+                                
+                                if mnist_file_path:
+                                    # 创建相对路径目录结构
+                                    relative_dir = '../../testdata'
+                                    os.makedirs(os.path.join(student_dir, relative_dir), exist_ok=True)
+                                    
+                                    # 复制文件到学生目录下的相对路径
+                                    target_path = os.path.join(student_dir, relative_dir, mnist_file)
+                                    if not os.path.exists(target_path):
+                                        try:
+                                            shutil.copy2(mnist_file_path, target_path)
+                                            print(f"复制MNIST数据文件到学生目录: {target_path}")
+                                        except Exception as e:
+                                            print(f"复制MNIST数据文件失败: {e}")
+                                    
+                                    # 同时检查是否有对应的gz文件
+                                    gz_file = f"{mnist_file}.gz"
+                                    gz_file_path = find_file_path(gz_file, experiment_id=experiment_id, sub_dir='testdata')
+                                    if not gz_file_path:
+                                        gz_file_path = find_file_path(gz_file, experiment_id=7, sub_dir='testdata')
+                                    
+                                    if gz_file_path:
+                                        target_gz_path = os.path.join(student_dir, relative_dir, gz_file)
+                                        if not os.path.exists(target_gz_path):
+                                            try:
+                                                shutil.copy2(gz_file_path, target_gz_path)
+                                                print(f"复制MNIST压缩数据文件到学生目录: {target_gz_path}")
+                                            except Exception as e:
+                                                print(f"复制MNIST压缩数据文件失败: {e}")
                 
                 student_module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(student_module)
@@ -379,19 +531,34 @@ def execute_student_code(student_code_path):
                     
                     # 读取真实标签文件
                     # 首先尝试相对于学生代码目录的路径
-                    labels_file = '../../testdata/all_labels.csv'
-                    # 如果不存在，尝试相对于实验目录的路径
+                    labels_file = os.path.join(student_dir, '../../testdata/all_labels.csv')
+                    
+                    # 如果不存在，尝试从路径中提取实验ID
                     if not os.path.exists(labels_file):
                         # 从学生代码路径提取实验ID
                         # 假设路径格式为 .../DLplatform-be/lab{experiment_id}/testcode/student_{student_id}_{timestamp}/...
                         path_parts = absolute_student_code_path.split(os.sep)
                         lab_index = -1
+                        experiment_id = None
+                        
                         for i, part in enumerate(path_parts):
                             if part.startswith('lab'):
                                 lab_index = i
+                                # 尝试提取实验ID
+                                try:
+                                    experiment_id = int(part[3:])  # 提取"lab"后面的数字
+                                    print(f"从路径提取到实验ID: {experiment_id}")
+                                except ValueError:
+                                    pass
                                 break
                         
-                        if lab_index >= 0:
+                        # 如果找到了实验ID，使用find_file_path函数查找标签文件
+                        if experiment_id is not None:
+                            found_labels_file = find_file_path('all_labels.csv', experiment_id=experiment_id, sub_dir='testdata')
+                            if found_labels_file:
+                                labels_file = found_labels_file
+                        # 如果没有找到实验ID但找到了lab目录，使用原来的方法
+                        elif lab_index >= 0:
                             lab_dir = os.path.join(*path_parts[:lab_index+1])
                             labels_file = os.path.join(lab_dir, 'testdata', 'all_labels.csv')
                     
@@ -490,6 +657,10 @@ def validate_email(email):
 
 def get_current_user():
     """获取当前登录用户"""
+    # 打印请求信息，用于调试
+    print(f"请求路径: {request.path}, 方法: {request.method}")
+    print(f"请求头: {dict(request.headers)}")
+    
     # 从请求头中获取用户信息
     auth_header = request.headers.get('Authorization')
     user_id_header = request.headers.get('User-ID')
@@ -507,6 +678,7 @@ def get_current_user():
     # 如果没有从User-ID获取到，尝试从Authorization头解析用户ID
     if not user_id and auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
+        print(f"从Authorization头获取到token: {token[:10]}...")
         try:
             # 尝试从token中提取user_id（简化处理）
             if token.startswith('api_token_'):
@@ -552,6 +724,14 @@ def get_current_user():
             return user
         else:
             print(f"找不到ID为{user_id}的用户")
+            
+            # 对于文件上传请求，如果找不到用户但有用户类型，创建一个临时用户对象
+            if request.path == '/teacher/experiment/attachment/upload' and user_type_header == 'teacher':
+                print(f"文件上传请求：创建临时教师用户，ID: {user_id}")
+                temp_user = User()
+                temp_user.user_id = user_id
+                temp_user.user_type = UserType.TEACHER
+                return temp_user
     
     print("无法确定当前用户，尝试返回默认用户")
     # 如果无法确定用户，尝试返回第一个用户（仅用于测试）
@@ -1325,35 +1505,65 @@ def download_submission(submission_id):
             print(f"文件不存在: {file_path}")
             print(f"当前工作目录: {os.getcwd()}")
             
-            # 获取当前工作目录和后端目录
-            current_dir = os.getcwd()
-            backend_dir = os.path.join(current_dir, "DLplatform-be")
-            
-            # 尝试不同的文件路径
+            # 使用文件路径查找工具函数查找提交文件
             experiment_id = submission.experiment_id
-            possible_paths = [
-                os.path.join(backend_dir, f"lab{experiment_id}", "testcode", file_name),
-                os.path.join(current_dir, f"lab{experiment_id}", "testcode", file_name),
-                os.path.join(f"lab{experiment_id}", "testcode", file_name),
-                # 尝试查找学生ID命名的目录
-                os.path.join(backend_dir, f"lab{experiment_id}", "testcode", str(submission.student_id)),
-                os.path.join(current_dir, f"lab{experiment_id}", "testcode", str(submission.student_id)),
-                os.path.join(f"lab{experiment_id}", "testcode", str(submission.student_id)),
-            ]
             
-            file_found = False
-            for path in possible_paths:
-                print(f"尝试替代路径: {path}")
-                if os.path.exists(path):
-                    print(f"找到文件在替代路径: {path}")
-                    file_path = path
-                    file_found = True
-                    break
+            # 首先尝试查找文件名
+            found_file_path = find_file_path(file_name, experiment_id=experiment_id, sub_dir="testcode")
+            
+            # 如果没找到，尝试查找以学生ID命名的目录
+            if not found_file_path:
+                # 获取学生信息
+                student = User.query.get(submission.student_id)
+                student_identifier = str(submission.student_id)
+                if student and student.student_id:
+                    student_identifier = student.student_id
+                
+                # 尝试查找学生ID目录
+                found_file_path = find_file_path(student_identifier, experiment_id=experiment_id, sub_dir="testcode")
+                
+                # 如果还是没找到，尝试在其他可能的位置查找
+                if not found_file_path:
+                    # 尝试在upload目录查找
+                    found_file_path = find_file_path(file_name, experiment_id=experiment_id, sub_dir="upload")
                     
-            if not file_found:
+                    # 如果还是没找到，尝试在testdata目录查找
+                    if not found_file_path:
+                        found_file_path = find_file_path(file_name, experiment_id=experiment_id, sub_dir="testdata")
+                        
+                    # 如果还是没找到，尝试在lab目录下直接查找
+                    if not found_file_path:
+                        found_file_path = find_file_path(file_name, experiment_id=experiment_id)
+                        
+                    # 如果还是没找到，尝试在当前工作目录和其子目录查找
+                    if not found_file_path:
+                        # 获取当前工作目录
+                        current_dir = os.getcwd()
+                        for root, dirs, files in os.walk(current_dir):
+                            if file_name in files:
+                                found_file_path = os.path.join(root, file_name)
+                                print(f"在当前工作目录下找到文件: {found_file_path}")
+                                break
+                            
+                            # 如果是目录，检查目录名是否匹配
+                            for dir_name in dirs:
+                                if dir_name == file_name or dir_name == student_identifier:
+                                    found_file_path = os.path.join(root, dir_name)
+                                    print(f"在当前工作目录下找到目录: {found_file_path}")
+                                    break
+            
+            if found_file_path:
+                print(f"找到文件在路径: {found_file_path}")
+                file_path = found_file_path
+                
+                # 更新数据库中的文件路径
+                submission.file_path = found_file_path
+                db.session.commit()
+                print(f"更新提交记录的文件路径: {found_file_path}")
+            else:
                 return jsonify({
                     'code': 404,
-                    'message': f'文件不存在，file_path: {file_path}'
+                    'message': f'文件不存在，file_name: {file_name}'
                 }), 404
         
         # 如果file_path是目录，则压缩整个目录
@@ -1521,6 +1731,140 @@ def update_experiment():
             'message': f'服务器内部错误: {str(e)}'
         }), 500
 
+# 上传实验附件
+@app.route('/teacher/experiment/attachment/upload', methods=['POST', 'OPTIONS'])
+def upload_experiment_attachment():
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+        
+    try:
+        # 打印请求信息，用于调试
+        print("附件上传请求头:", dict(request.headers))
+        print("附件上传表单数据:", dict(request.form))
+        print("附件上传文件:", request.files.keys() if request.files else "无文件")
+        
+        # 获取当前登录用户
+        current_user = get_current_user()
+        if not current_user:
+            print("用户未登录或会话已过期")
+            return jsonify({
+                'code': 401,
+                'message': '未登录或登录已过期'
+            }), 401
+        
+        # 确保是教师用户
+        user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+        if user_type != 'teacher':
+            return jsonify({
+                'code': 403,
+                'message': '只有教师可以上传附件'
+            }), 403
+        
+        # 检查是否有文件
+        if 'file' not in request.files:
+            return jsonify({
+                'code': 400,
+                'message': '没有上传文件'
+            }), 400
+            
+        file = request.files['file']
+        
+        # 检查文件名是否为空
+        if file.filename == '':
+            return jsonify({
+                'code': 400,
+                'message': '没有选择文件'
+            }), 400
+        
+        # 获取实验ID
+        experiment_id = request.form.get('experiment_id')
+        if not experiment_id:
+            return jsonify({
+                'code': 400,
+                'message': '缺少experiment_id参数'
+            }), 400
+        
+        # 查询实验
+        experiment = Experiment.query.get(experiment_id)
+        if not experiment:
+            return jsonify({
+                'code': 404,
+                'message': '实验不存在'
+            }), 404
+        
+        # 检查是否是实验的创建者
+        if experiment.teacher_id != current_user.user_id:
+            return jsonify({
+                'code': 403,
+                'message': '只有实验创建者可以上传附件'
+            }), 403
+        
+        # 确保实验目录及子目录存在
+        upload_folder = ensure_experiment_dir(experiment_id, "upload")
+        
+        # 检查是否已存在同名附件
+        existing_attachment = ExperimentAttachment.query.filter_by(
+            experiment_id=experiment_id, 
+            file_name=file.filename
+        ).first()
+        
+        # 保存文件
+        file_path = os.path.join(upload_folder, file.filename)
+        file.save(file_path)
+        
+        print(f"文件保存到: {file_path}")
+        
+        # 获取文件大小（字节）
+        file_size = os.path.getsize(file_path)
+        
+        if existing_attachment:
+            # 更新现有附件记录
+            existing_attachment.file_size = file_size
+            existing_attachment.file_path = file_path
+            db.session.commit()
+            
+            print(f"更新附件记录: {existing_attachment.attachment_id}")
+            
+            return jsonify({
+                'code': 200,
+                'message': '附件更新成功',
+                'data': {
+                    'attachment': existing_attachment.to_dict()
+                }
+            })
+        else:
+            # 创建新附件记录
+            new_attachment = ExperimentAttachment(
+                experiment_id=experiment_id,
+                file_name=file.filename,
+                file_path=file_path,
+                file_size=file_size
+            )
+            
+            db.session.add(new_attachment)
+            db.session.commit()
+            
+            return jsonify({
+                'code': 200,
+                'message': '附件上传成功',
+                'data': {
+                    'attachment': new_attachment.to_dict()
+                }
+            })
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"上传附件错误: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': f'服务器内部错误: {str(e)}'
+        }), 500
+
+
+
 # 删除实验
 @app.route('/teacher/experiment/delete', methods=['POST'])
 def delete_experiment():
@@ -1683,26 +2027,16 @@ def publish_experiment():
         db.session.add(new_experiment)
         db.session.flush()  # 获取新实验ID
         
-        # 获取当前工作目录和后端目录
-        current_dir = os.getcwd()
-        backend_dir = os.path.join(current_dir, "DLplatform-be")
-        print(f"当前工作目录: {current_dir}")
-        print(f"后端目录: {backend_dir}")
+        # 创建实验目录结构
+        experiment_id = new_experiment.experiment_id
         
-        # 创建lab+experiment_id文件夹及其子文件夹，放在后端目录下
-        lab_folder = f"lab{new_experiment.experiment_id}"
-        lab_path = os.path.join(backend_dir, lab_folder)
-        testcode_folder = os.path.join(lab_path, "testcode")
-        testdata_folder = os.path.join(lab_path, "testdata")
-        upload_folder = os.path.join(lab_path, "upload")
+        # 确保实验目录及子目录存在
+        lab_path = ensure_experiment_dir(experiment_id)
+        testcode_folder = ensure_experiment_dir(experiment_id, "testcode")
+        testdata_folder = ensure_experiment_dir(experiment_id, "testdata")
+        upload_folder = ensure_experiment_dir(experiment_id, "upload")
         
-        print(f"创建文件夹: {lab_path}")
-        
-        # 创建文件夹
-        os.makedirs(lab_path, exist_ok=True)
-        os.makedirs(testcode_folder, exist_ok=True)
-        os.makedirs(testdata_folder, exist_ok=True)
-        os.makedirs(upload_folder, exist_ok=True)
+        print(f"创建实验目录: {lab_path}")
         
         # 保存文件到lab文件夹中的upload文件夹
         file_path = os.path.join(upload_folder, file.filename)
@@ -1814,16 +2148,9 @@ def submit():
             student_id=student_id
         ).first()
         
-        # 获取当前工作目录和后端目录
-        current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        backend_dir = os.path.join(current_dir, "DLplatform-be")
-        print(f"当前工作目录: {current_dir}")
-        print(f"后端目录: {backend_dir}")
-        
-        # 使用lab文件夹的testcode目录，放在后端目录下
-        lab_folder = f"lab{experiment_id}"
-        lab_path = os.path.join(backend_dir, lab_folder)
-        testcode_folder = os.path.join(lab_path, "testcode")
+        # 确保实验目录及子目录存在
+        testcode_folder = ensure_experiment_dir(experiment_id, "testcode")
+        print(f"使用实验代码目录: {testcode_folder}")
         
         print(f"上传文件到: {testcode_folder}")
         
@@ -1910,18 +2237,6 @@ def submit():
                 existing_submission.submit_time = datetime.utcnow()
                 print(f"更新提交记录: {existing_submission}")
                 
-                # 更新附件记录
-                existing_experiment_attachment = ExperimentAttachment.query.filter_by(
-                    file_name=existing_submission.file_name,
-                    file_path=existing_submission.file_path
-                ).first()
-                
-                if existing_experiment_attachment:
-                    existing_experiment_attachment.file_name = file_name_without_ext  # 使用不带扩展名的原始文件名
-                    existing_experiment_attachment.file_path = testcode_folder  # 保存解压后的文件夹路径
-                    existing_experiment_attachment.file_size = folder_size
-                    print(f"更新附件记录: {existing_experiment_attachment}")
-                    
                 db.session.commit()
                 print("数据库更新成功")
             except Exception as e:
@@ -1978,13 +2293,6 @@ def submit():
             folder_size = folder_size // 1024
             print(f"文件夹大小: {folder_size}KB")
             
-            # 插入实验附件记录和学生提交记录（使用文件夹名称和路径）
-            if not insert_experiment_attachment(experiment_id, file_name_without_ext, testcode_folder, folder_size):
-                return jsonify({
-                    'code': 500,
-                    'message': '保存实验附件记录失败'
-                }), 500
-            
             # 插入学生提交记录
             if not insert_submission(experiment_id, student_id, file_name_without_ext, testcode_folder):
                 return jsonify({
@@ -2013,8 +2321,25 @@ def get_api_experiment_uploads(experiment_id):
     获取实验的上传历史（新API路径）
     """
     try:
+        # 获取当前登录用户
+        current_user = get_current_user()
+        if not current_user:
+            return jsonify({
+                'code': 401,
+                'message': '未授权访问'
+            }), 401
+        
         # 获取该实验的所有提交记录
-        submissions = Submission.query.filter_by(experiment_id=experiment_id).all()
+        # 如果是学生用户，只返回自己的提交记录
+        if current_user.user_type.value == 'student':
+            submissions = Submission.query.filter_by(
+                experiment_id=experiment_id,
+                student_id=current_user.user_id
+            ).all()
+        else:
+            # 教师可以看到所有提交记录
+            submissions = Submission.query.filter_by(experiment_id=experiment_id).all()
+            
         print(f"实验 {experiment_id} 的提交记录: {submissions}")
         upload_history = []
         for submission in submissions:
@@ -2107,29 +2432,51 @@ def test_models():
         lab_folder = f"lab{experiment_id}"
         print(f"实验对应的文件夹: {lab_folder}")
         
-                # 优先查找实验对应的testdata目录下的all_labels.csv
-        possible_label_paths = [
-            os.path.join(os.getcwd(), lab_folder, "testdata", "all_labels.csv"),  # 当前目录下的实验文件夹
-            os.path.join(os.getcwd(), "..", lab_folder, "testdata", "all_labels.csv"),  # 上级目录下的实验文件夹
-            os.path.join(os.getcwd(), "testdata", "all_labels.csv")  # 当前目录下的testdata文件夹
-        ]
-            
-        # 如果当前实验不是lab7，也尝试查找lab7中的标签文件作为备用
-        if lab_folder != "lab7":
-            possible_label_paths.append(os.path.join(os.getcwd(), "lab7", "testdata", "all_labels.csv"))
+        # 使用文件路径查找工具函数查找标签文件
+        labels_file = find_file_path("all_labels.csv", experiment_id=experiment_id, sub_dir="testdata")
         
-        labels_file = None
-        for path in possible_label_paths:
-            if os.path.exists(path):
-                labels_file = path
-                print(f"找到真实标签文件: {labels_file}")
-                break
+        # 如果当前实验没有找到标签文件，尝试查找lab7中的标签文件作为备用
+        if not labels_file and lab_folder != "lab7":
+            labels_file = find_file_path("all_labels.csv", experiment_id=7, sub_dir="testdata")
+        
         if not labels_file:
             return jsonify({
                 'code': 400,
                 'message': f'找不到真实标签文件，请确保{lab_folder}/testdata目录中存在all_labels.csv文件'
             }), 400
-            
+        
+        print(f"找到真实标签文件: {labels_file}")
+        
+        # 检查并准备MNIST数据集文件（如果需要）
+        mnist_files = ['t10k-images-idx3-ubyte', 't10k-labels-idx1-ubyte']
+        mnist_files_paths = {}
+        
+        # 如果是需要MNIST数据集的实验（实验7、8、9等），预先查找数据文件
+        if int(experiment_id) in [7, 8, 9]:
+            print(f"检测到实验{experiment_id}可能需要MNIST数据集，预先查找数据文件")
+            for mnist_file in mnist_files:
+                # 尝试查找MNIST数据文件
+                mnist_file_path = find_file_path(mnist_file, experiment_id=experiment_id, sub_dir='testdata')
+                if not mnist_file_path:
+                    # 如果当前实验目录没有，尝试在lab7中查找
+                    mnist_file_path = find_file_path(mnist_file, experiment_id=7, sub_dir='testdata')
+                
+                if mnist_file_path:
+                    mnist_files_paths[mnist_file] = mnist_file_path
+                    print(f"找到MNIST数据文件: {mnist_file} -> {mnist_file_path}")
+                    
+                    # 同时查找对应的gz文件
+                    gz_file = f"{mnist_file}.gz"
+                    gz_file_path = find_file_path(gz_file, experiment_id=experiment_id, sub_dir='testdata')
+                    if not gz_file_path:
+                        gz_file_path = find_file_path(gz_file, experiment_id=7, sub_dir='testdata')
+                    
+                    if gz_file_path:
+                        mnist_files_paths[gz_file] = gz_file_path
+                        print(f"找到MNIST压缩数据文件: {gz_file} -> {gz_file_path}")
+                else:
+                    print(f"警告：未找到MNIST数据文件: {mnist_file}")
+        
         # 读取真实标签
         try:
             labels_df = pd.read_csv(labels_file)
@@ -2173,7 +2520,8 @@ def test_models():
                 print(f"评测学生 {submission.student_id} 的提交: {student_folder_path}")
                 
                 # 检查是否是特殊情况：文件夹是lab/testcode/学号
-                testcode_path = os.path.join(os.getcwd(), lab_folder, "testcode")
+                # 获取testcode路径
+                testcode_path = ensure_experiment_dir(experiment_id, "testcode")
                 is_testcode_submission = student_folder_path.startswith(testcode_path)
                 
                 # 在文件夹中查找Python文件
@@ -2277,6 +2625,31 @@ def test_models():
                         print(f"复制标签文件到学生目录: {student_labels_file}")
                     except Exception as e:
                         print(f"复制标签文件失败，但将继续尝试评测: {e}")
+                
+                # 如果是需要MNIST数据集的实验，复制MNIST数据文件到学生目录
+                if int(experiment_id) in [7, 8, 9] and mnist_files_paths:
+                    # 检查学生代码中是否有对MNIST数据文件的引用
+                    try:
+                        with open(main_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            code_content = f.read()
+                            if any(mnist_file in code_content for mnist_file in mnist_files):
+                                print("检测到代码中可能使用MNIST数据文件，准备复制数据文件")
+                                
+                                # 创建相对路径目录结构
+                                relative_dir = '../../testdata'
+                                os.makedirs(os.path.join(student_dir, relative_dir), exist_ok=True)
+                                
+                                # 复制所有找到的MNIST文件到学生目录
+                                for file_name, file_path in mnist_files_paths.items():
+                                    target_path = os.path.join(student_dir, relative_dir, file_name)
+                                    if not os.path.exists(target_path):
+                                        try:
+                                            shutil.copy2(file_path, target_path)
+                                            print(f"复制MNIST数据文件到学生目录: {target_path}")
+                                        except Exception as e:
+                                            print(f"复制MNIST数据文件失败: {e}")
+                    except Exception as e:
+                        print(f"检查学生代码中的MNIST引用时出错: {e}")
                 
                 # 执行学生代码进行评测
                 print(f"开始执行学生代码: {main_file}")
@@ -2914,36 +3287,45 @@ def download_attachment(attachment_id):
             print(f"文件不存在: {attachment.file_path}")
             print(f"当前工作目录: {os.getcwd()}")
             
-            # 尝试在lab文件夹中查找
+            # 尝试查找附件文件
             experiment_id = attachment.experiment_id
             file_name = attachment.file_name
             
-            # 获取当前工作目录和后端目录
-            current_dir = os.getcwd()
-            backend_dir = os.path.join(current_dir, "DLplatform-be")
-            print(f"后端目录: {backend_dir}")
+            # 使用文件路径查找工具函数
+            found_file_path = find_file_path(file_name, experiment_id=experiment_id, sub_dir="upload")
             
-            # 尝试不同的文件路径
-            possible_paths = [
-                os.path.join(backend_dir, f"lab{experiment_id}", "upload", file_name),  # 后端目录下的lab文件夹
-                os.path.join(current_dir, f"lab{experiment_id}", "upload", file_name),  # 当前目录下的lab文件夹
-                os.path.join(f"lab{experiment_id}", "upload", file_name),  # 相对路径
-            ]
+            # 如果没找到，尝试在其他可能的位置查找
+            if not found_file_path:
+                # 尝试在testdata目录查找
+                found_file_path = find_file_path(file_name, experiment_id=experiment_id, sub_dir="testdata")
+                
+                # 如果还是没找到，尝试在testcode目录查找
+                if not found_file_path:
+                    found_file_path = find_file_path(file_name, experiment_id=experiment_id, sub_dir="testcode")
+                    
+                # 如果还是没找到，尝试在lab目录下直接查找
+                if not found_file_path:
+                    found_file_path = find_file_path(file_name, experiment_id=experiment_id)
+                    
+                # 如果还是没找到，尝试在当前工作目录和其子目录查找
+                if not found_file_path:
+                    # 获取当前工作目录
+                    current_dir = os.getcwd()
+                    for root, dirs, files in os.walk(current_dir):
+                        if file_name in files:
+                            found_file_path = os.path.join(root, file_name)
+                            print(f"在当前工作目录下找到文件: {found_file_path}")
+                            break
             
-            file_found = False
-            for path in possible_paths:
-                print(f"尝试替代路径: {path}")
-                if os.path.exists(path):
-                    print(f"找到文件在替代路径: {path}")
-                    attachment.file_path = path
-                    db.session.commit()
-                    file_found = True
-                    break
-            
-            if not file_found:
+            if found_file_path:
+                print(f"找到文件在路径: {found_file_path}")
+                attachment.file_path = found_file_path
+                db.session.commit()
+                file_found = True
+            else:
                 return jsonify({
                     'code': 404,
-                    'message': f'文件不存在，file_path: {attachment.file_path}'
+                    'message': f'文件不存在，file_name: {file_name}'
                 }), 404
         
         # 获取文件名，使用原始文件名
@@ -3545,11 +3927,8 @@ def upload_experiment_testdata():
         # 获取实验对应的lab文件夹
         lab_name = f"lab{experiment_id}"  # 假设实验ID对应lab文件夹名称
         
-        # 确保testdata文件夹存在（而不是testcode）
-        # 使用后端目录下的实验文件夹，而不是当前工作目录
-        backend_dir = os.path.dirname(os.path.abspath(__file__))  # 获取后端目录的绝对路径
-        testdata_dir = os.path.join(backend_dir, lab_name, 'testdata')
-        os.makedirs(testdata_dir, exist_ok=True)
+        # 确保testdata文件夹存在
+        testdata_dir = ensure_experiment_dir(experiment_id, "testdata")
         
         # 保存上传的文件到临时位置
         temp_zip_path = os.path.join(testdata_dir, 'temp_testdata.zip')
@@ -3904,6 +4283,186 @@ def check_plagiarism():
         
     except Exception as e:
         print(f"查重过程中出错: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': f'服务器内部错误: {str(e)}'
+        }), 500
+
+@app.route('/student/results', methods=['GET', 'OPTIONS'])
+def get_student_results():
+    """获取学生实验结果列表"""
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    # 获取当前登录用户
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({'code': 401, 'message': '未授权，请先登录'}), 401
+    
+    # 确保是学生用户
+    user_type = current_user.user_type.value if isinstance(current_user.user_type, UserType) else current_user.user_type
+    if user_type != 'student':
+        return jsonify({'code': 403, 'message': '权限不足，仅学生可访问此接口'}), 403
+    
+    # 获取分页参数
+    page = request.args.get('page', 1, type=int)
+    page_size = request.args.get('pageSize', 10, type=int)
+    
+    # 计算偏移量
+    offset = (page - 1) * page_size
+    
+    try:
+        # 获取学生的所有实验成绩
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 查询学生的实验成绩
+        query = """
+        SELECT g.grade_id, g.score, g.graded_at, 
+               e.experiment_id, e.experiment_name, 
+               s.submit_time, s.submission_id
+        FROM grades g
+        JOIN experiments e ON g.experiment_id = e.experiment_id
+        JOIN submissions s ON g.submission_id = s.submission_id
+        WHERE g.student_id = %s
+        ORDER BY g.graded_at DESC
+        LIMIT %s OFFSET %s
+        """
+        cursor.execute(query, (current_user.user_id, page_size, offset))
+        results = cursor.fetchall()
+        
+        # 获取总记录数
+        count_query = """
+        SELECT COUNT(*) as total
+        FROM grades
+        WHERE student_id = %s
+        """
+        cursor.execute(count_query, (current_user.user_id,))
+        total = cursor.fetchone()['total']
+        
+        # 格式化日期时间
+        for result in results:
+            if result['graded_at']:
+                result['graded_at'] = result['graded_at'].strftime('%Y-%m-%d %H:%M:%S')
+            if result['submit_time']:
+                result['submit_time'] = result['submit_time'].strftime('%Y-%m-%d %H:%M:%S')
+        
+        conn.close()
+        
+        return jsonify({
+            'code': 200,
+            'message': '获取成功',
+            'data': results,
+            'total': total
+        })
+    
+    except Exception as e:
+        print(f"获取学生实验结果失败: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': f'服务器错误: {str(e)}'}), 500
+
+# 批量下载提交文件
+@app.route('/download/submissions/batch', methods=['GET', 'OPTIONS'])
+def download_submissions_batch():
+    """
+    批量下载指定实验的所有学生提交
+    """
+    # 处理OPTIONS请求（预检请求）
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        return response
+        
+    try:
+        # 获取实验ID
+        experiment_id = request.args.get('experiment_id')
+        if not experiment_id:
+            return jsonify({
+                'code': 400,
+                'message': '缺少实验ID参数'
+            }), 400
+            
+        # 验证实验是否存在
+        experiment = Experiment.query.get(experiment_id)
+        if not experiment:
+            return jsonify({
+                'code': 404,
+                'message': '实验不存在'
+            }), 404
+            
+        # 获取该实验的第一个学生提交记录
+        submission = Submission.query.filter_by(experiment_id=experiment_id).first()
+        if not submission:
+            return jsonify({
+                'code': 404,
+                'message': '未找到提交记录'
+            }), 404
+            
+        # 获取学生信息
+        student = User.query.get(submission.student_id)
+        student_name = student.real_name or student.username if student else f"student_{submission.student_id}"
+        
+        # 处理文件路径
+        file_path = submission.file_path
+        if not file_path or not os.path.exists(file_path):
+            return jsonify({
+                'code': 404,
+                'message': f'文件不存在: {file_path}'
+            }), 404
+            
+        # 如果是目录，创建一个ZIP文件
+        if os.path.isdir(file_path):
+            # 创建临时ZIP文件
+            temp_zip_path = os.path.join(os.getcwd(), f"temp_download_{int(time.time())}.zip")
+            
+            try:
+                # 压缩文件夹
+                with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(file_path):
+                        for file in files:
+                            file_full_path = os.path.join(root, file)
+                            # 直接使用文件名，不再添加学生名称作为前缀目录
+                            rel_path = os.path.relpath(file_full_path, file_path)
+                            zipf.write(file_full_path, rel_path)
+                
+                # 发送ZIP文件
+                return send_file(
+                    temp_zip_path,
+                    as_attachment=True,
+                    download_name=f"experiment_{experiment_id}_submission.zip",
+                    mimetype='application/zip'
+                )
+            except Exception as e:
+                print(f"压缩文件时出错: {str(e)}")
+                traceback.print_exc()
+                return jsonify({
+                    'code': 500,
+                    'message': f'服务器内部错误: {str(e)}'
+                }), 500
+            finally:
+                # 清理临时文件
+                def cleanup():
+                    try:
+                        if os.path.exists(temp_zip_path):
+                            os.remove(temp_zip_path)
+                            print(f"已删除临时文件: {temp_zip_path}")
+                    except Exception as e:
+                        print(f"清理临时文件失败: {str(e)}")
+                
+                # 使用线程延迟清理，确保文件发送完成
+                threading.Timer(60, cleanup).start()
+        else:
+            # 如果是单个文件，直接发送
+            return send_file(
+                file_path,
+                as_attachment=True,
+                download_name=os.path.basename(file_path),
+                mimetype='application/octet-stream'
+            )
+    
+    except Exception as e:
+        print(f"下载提交文件时出错: {str(e)}")
         traceback.print_exc()
         return jsonify({
             'code': 500,
